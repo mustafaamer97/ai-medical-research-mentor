@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import List, Optional
+from typing import List, Literal, Optional
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, field_validator
@@ -52,8 +52,21 @@ class TaskPriority(str, Enum):
     CRITICAL = "CRITICAL"
 
 
+class FrameworkCompleteness(str, Enum):
+    COMPLETE = "COMPLETE"
+    NEEDS_CLARIFICATION = "NEEDS_CLARIFICATION"
+    INCOMPLETE = "INCOMPLETE"
+
+
+class ScreeningDecisionEnum(str, Enum):
+    PENDING = "PENDING"
+    INCLUDE = "INCLUDE"
+    EXCLUDE = "EXCLUDE"
+    MAYBE = "MAYBE"
+
+
 # ──────────────────────────────────────────────
-# Sub-models
+# Sprint 1 Sub-models
 # ──────────────────────────────────────────────
 
 class ResearchQuestion(BaseModel):
@@ -146,7 +159,185 @@ class StudyDesign(BaseModel):
 
 
 # ──────────────────────────────────────────────
-# Task Model
+# Sprint 2 Models
+# ──────────────────────────────────────────────
+
+class ResearchFramework(BaseModel):
+    """
+    Structured PICO/PECO research framework.
+
+    PICO: Population, Intervention, Comparator, Outcome
+    PECO: Population, Exposure, Comparator, Outcome
+
+    Fields are plain strings. Does not duplicate the richer Sprint 1
+    sub-models. Integrated with ResearchProject via research_framework field.
+    """
+    framework_type: Literal["PICO", "PECO"] = Field(
+        ..., description="PICO for intervention studies, PECO for observational studies"
+    )
+    population: Optional[str] = Field(default=None, description="P — target population")
+    intervention: Optional[str] = Field(default=None, description="I — intervention (PICO only)")
+    exposure: Optional[str] = Field(default=None, description="E — exposure (PECO only)")
+    comparator: Optional[str] = Field(default=None, description="C — comparator or control")
+    outcome: Optional[str] = Field(default=None, description="O — primary outcome")
+    time_frame: Optional[str] = Field(default=None, description="Follow-up or measurement time frame")
+    rationale: Optional[str] = Field(default=None, description="Researcher rationale for framework choices")
+    confidence_notes: Optional[str] = Field(default=None, description="Notes about uncertainty or missing information")
+
+    model_config = {"frozen": False}
+
+    def required_fields(self) -> List[str]:
+        """Returns list of field names required for this framework type."""
+        base = ["population", "comparator", "outcome"]
+        if self.framework_type == "PICO":
+            return base + ["intervention"]
+        return base + ["exposure"]
+
+    def missing_fields(self) -> List[str]:
+        """Returns list of required field names that are not yet populated."""
+        missing = []
+        for field in self.required_fields():
+            val = getattr(self, field, None)
+            if not val or not str(val).strip():
+                missing.append(field)
+        return missing
+
+    def is_complete(self) -> bool:
+        """Returns True only when all required fields are populated."""
+        return len(self.missing_fields()) == 0
+
+
+class StudyDesignRecommendation(BaseModel):
+    """
+    Deterministic study design recommendation based on framework type.
+    Always labelled as a suggestion — never authoritative.
+    needs_expert_review is always True.
+    """
+    recommended_design: StudyDesignType
+    alternative_designs: List[StudyDesignType] = Field(default_factory=list)
+    rationale: str = Field(..., description="Why this design was suggested")
+    limitations: List[str] = Field(default_factory=list)
+    needs_expert_review: bool = Field(
+        default=True,
+        description="Always True — recommendation requires expert review",
+    )
+
+    model_config = {"frozen": False}
+
+
+class FrameworkValidationResult(BaseModel):
+    """Result of validating a ResearchFramework for completeness."""
+    status: FrameworkCompleteness
+    missing_fields: List[str] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+    draft_question: Optional[str] = Field(
+        default=None,
+        description="Draft research question — only populated when status is COMPLETE",
+    )
+    completeness_score: int = Field(default=0, ge=0, le=100)
+
+    model_config = {"frozen": False}
+
+
+# ──────────────────────────────────────────────
+# Sprint 3 Models
+# ──────────────────────────────────────────────
+
+class LiteratureSearchStrategy(BaseModel):
+    """
+    Deterministic literature search strategy built from a ResearchFramework.
+
+    All terms come exclusively from researcher-provided data.
+    No synonyms, MeSH terms, or medical concepts are invented.
+    Boolean query is only generated when required elements are present.
+    """
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    framework_type: Literal["PICO", "PECO"]
+
+    population_terms: List[str] = Field(
+        default_factory=list,
+        description="Search terms derived from population — researcher-provided only",
+    )
+    intervention_terms: List[str] = Field(
+        default_factory=list,
+        description="Search terms derived from intervention — PICO only",
+    )
+    exposure_terms: List[str] = Field(
+        default_factory=list,
+        description="Search terms derived from exposure — PECO only",
+    )
+    comparator_terms: List[str] = Field(
+        default_factory=list,
+        description="Search terms derived from comparator",
+    )
+    outcome_terms: List[str] = Field(
+        default_factory=list,
+        description="Search terms derived from outcome",
+    )
+
+    boolean_query: Optional[str] = Field(
+        default=None,
+        description="Structured Boolean query — only generated when required elements are present",
+    )
+
+    warnings: List[str] = Field(default_factory=list)
+    missing_components: List[str] = Field(default_factory=list)
+    ready_for_search: bool = Field(
+        default=False,
+        description="True only when population, primary IE element, and outcome are all present",
+    )
+
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    model_config = {"frozen": False}
+
+
+class LiteratureRecord(BaseModel):
+    """
+    Structured model for a literature record retrieved from an external source.
+
+    IMPORTANT: This model is a data structure only.
+    No fake or synthetic records are ever created by this application.
+    Records are populated only from actual external retrieval (future sprint).
+    """
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    title: Optional[str] = Field(default=None)
+    authors: List[str] = Field(default_factory=list)
+    journal: Optional[str] = Field(default=None)
+    publication_date: Optional[str] = Field(
+        default=None,
+        description="Publication date as provided by the source",
+    )
+    abstract: Optional[str] = Field(default=None)
+    doi: Optional[str] = Field(default=None)
+    pmid: Optional[str] = Field(default=None)
+    source: Optional[str] = Field(
+        default=None,
+        description="Source database (e.g., PubMed, Embase) — populated on retrieval only",
+    )
+    url: Optional[str] = Field(default=None)
+    retrieved_at: Optional[datetime] = Field(default=None)
+
+    model_config = {"frozen": False}
+
+
+class ScreeningDecision(BaseModel):
+    """
+    Researcher-made screening decision for a single literature record.
+
+    Screening decisions are made by the researcher, not automatically by the system.
+    """
+    record_id: str = Field(...)
+    decision: ScreeningDecisionEnum = Field(default=ScreeningDecisionEnum.PENDING)
+    reason: Optional[str] = Field(default=None)
+    notes: Optional[str] = Field(default=None)
+    decided_at: Optional[datetime] = Field(default=None)
+
+    model_config = {"frozen": False}
+
+
+# ──────────────────────────────────────────────
+# Task Model (Sprint 1 — unchanged)
 # ──────────────────────────────────────────────
 
 class ResearchTask(BaseModel):
@@ -174,6 +365,7 @@ class ResearchProject(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
+    # Sprint 1 fields
     research_question: Optional[ResearchQuestion] = Field(default=None)
     study_design: Optional[StudyDesign] = Field(default=None)
     population: Optional[Population] = Field(default=None)
@@ -186,6 +378,14 @@ class ResearchProject(BaseModel):
     exclusion_criteria: ExclusionCriteria = Field(default_factory=ExclusionCriteria)
     sample_size_plan: Optional[SampleSizePlan] = Field(default=None)
     analysis_plan: Optional[AnalysisPlan] = Field(default=None)
+
+    # Sprint 2 fields
+    research_framework: Optional[ResearchFramework] = Field(default=None)
+
+    # Sprint 3 fields
+    literature_search_strategy: Optional[LiteratureSearchStrategy] = Field(default=None)
+    literature_records: List[LiteratureRecord] = Field(default_factory=list)
+    screening_decisions: List[ScreeningDecision] = Field(default_factory=list)
 
     state: ResearchStateEnum = Field(default=ResearchStateEnum.IDEA)
     tasks: List[ResearchTask] = Field(default_factory=list)
@@ -202,7 +402,7 @@ class ResearchProject(BaseModel):
 
 class ResearchState(BaseModel):
     project: Optional[ResearchProject] = Field(default=None)
-    schema_version: str = Field(default="1.0.0")
+    schema_version: str = Field(default="1.2.0")
     saved_at: datetime = Field(default_factory=datetime.utcnow)
 
     model_config = {"frozen": False}
