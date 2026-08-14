@@ -25,25 +25,8 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest
-          pip install -r requirements.txt
-
-      - name: Diagnose repository structure
-        run: |
-          echo "=== CURRENT DIRECTORY ==="
-          pwd
-          echo "=== ROOT CONTENTS ==="
-          ls -la
-          echo "=== DIRECTORY TREE ==="
-          find . -maxdepth 2 -type f | sort
-          echo "=== CORE DIRECTORY ==="
-          ls -la core || true
-          echo "=== TESTS DIRECTORY ==="
-          ls -la tests || true
-          echo "=== PYTHON PATH ==="
-          python -c "import sys; print('\n'.join(sys.path))"
-          echo "=== CORE IMPORT TEST ==="
-          python -c "import core; print('CORE IMPORT OK:', core.__file__)" || true
+          pip install pytest pydantic streamlit
+          if [ -s requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Run tests
         run: |
