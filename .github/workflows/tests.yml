@@ -26,9 +26,13 @@ jobs:
           pip install pytest
 
       - name: Run pytest
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: |
-          PYTHONPATH=. python -m pytest tests/ -v
+          python -m pytest tests/ -v
 
       - name: Run smoke test
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: |
-          PYTHONPATH=. python smoke_test.py
+          python smoke_test.py
