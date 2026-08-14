@@ -5,35 +5,57 @@ Sprint 2 — Deterministic Research Framework Engine
 
 Provides:
 - PICO / PECO inference and structuring
-- Research framework validation
-- Study design recommendation engine
-- State gate evaluation (No-Invention Rule enforced throughout)
+- Research framework construction from explicit fields
+- Research question generation
+- Framework validation
+- Research objectives generation
+- Study design recommendation
+- State gate checks
+- Framework task generation
 
-No-Invention Rule: All outputs are derived deterministically from user-supplied
-inputs. The engine never fabricates populations, outcomes, exposures, or
-comparators that were not present in the source data.
+No-Invention Rule: All outputs are derived deterministically from
+user-supplied inputs. The engine never fabricates populations, outcomes,
+exposures, comparators, objectives, or tasks that were not grounded in
+the source data provided by the caller.
 """
 
 from __future__ import annotations
 
 import re
+import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
-# Internal imports — tolerant of partial Sprint 1/2 model availability
+# Internal imports — tolerant of partial model availability
 # ---------------------------------------------------------------------------
 try:
-    from core.models import ResearchProject, ProjectStatus
-except ImportError:  # pragma: no cover
-    ResearchProject = None  # type: ignore
-    ProjectStatus = None  # type: ignore
+    from core.models import (
+        ResearchProject,
+        ProjectStatus,
+        ResearchFramework,
+        ResearchQuestion,
+        StudyDesignModel,
+        StateGateError,
+    )
+except ImportError:
+    # Provide lightweight sentinels so the engine loads in isolation
+    ResearchProject = None          # type: ignore[assignment,misc]
+    ProjectStatus = None            # type: ignore[assignment,misc]
+    ResearchFramework = None        # type: ignore[assignment,misc]
+    ResearchQuestion = None         # type: ignore[assignment,misc]
+    StudyDesignModel = None         # type: ignore[assignment,misc]
+
+    class StateGateError(Exception):  # type: ignore[no-redef]
+        """Raised when a state gate check fails."""
+
 
 try:
     from core.state import StateManager
-except ImportError:  # pragma: no cover
-    StateManager = None  # type: ignore
+except ImportError:
+    StateManager = None             # type: ignore[assignment,misc]
 
 
 # ===========================================================================
@@ -61,6 +83,12 @@ class ValidationStatus(str, Enum):
     INCOMPLETE = "INCOMPLETE"
 
 
+class TaskStatus(str, Enum):
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    COMPLETE = "complete"
+
+
 # ===========================================================================
 # Data containers
 # ===========================================================================
@@ -77,7 +105,6 @@ class PICOFramework:
     setting: Optional[str] = None
 
     def is_complete(self) -> bool:
-        """Return True only if all four core PICO elements are non-empty."""
         return all([
             self.population.strip(),
             self.intervention.strip(),
@@ -179,6 +206,8 @@ class ResearchFrameworkResult:
     validation: Optional[ValidationResult] = None
     study_design: Optional[StudyDesignRecommendation] = None
     raw_question: str = ""
+    generated_question: str = ""
+    objectives: List[str] = field(default_factory=list)
     schema_version: str = "1.2.0"
 
     def to_dict(self) -> Dict[str, Any]:
@@ -186,6 +215,8 @@ class ResearchFrameworkResult:
             "schema_version": self.schema_version,
             "framework_type": self.framework_type.value,
             "raw_question": self.raw_question,
+            "generated_question": self.generated_question,
+            "objectives": self.objectives,
             "pico": self.pico.to_dict() if self.pico else None,
             "peco": self.peco.to_dict() if self.peco else None,
             "validation": self.validation.to_dict() if self.validation else None,
@@ -193,8 +224,31 @@ class ResearchFrameworkResult:
         }
 
 
+@dataclass
+class FrameworkTask:
+    """A single actionable task generated for the framework phase."""
+    task_id: str
+    title: str
+    description: str
+    phase: str = "framework"
+    status: TaskStatus = TaskStatus.PENDING
+    priority: int = 1
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "title": self.title,
+            "description": self.description,
+            "phase": self.phase,
+            "status": self.status.value,
+            "priority": self.priority,
+            "metadata": self.metadata,
+        }
+
+
 # ===========================================================================
-# PICO / PECO Inference Engine
+# Keyword banks for deterministic scoring
 # ===========================================================================
 
 _EXPOSURE_KEYWORDS: List[str] = [
@@ -212,38 +266,61 @@ _INTERVENTION_KEYWORDS: List[str] = [
     "compared to", "versus", "vs",
 ]
 
+_RCT_KEYWORDS: List[str] = [
+    "randomized", "randomised", "rct", "trial", "placebo",
+    "blinded", "double-blind", "single-blind",
+    "treatment", "intervention", "drug", "therapy", "vaccine",
+    "efficacy", "effectiveness",
+]
+
+_COHORT_KEYWORDS: List[str] = [
+    "cohort", "longitudinal", "follow-up", "follow up", "prospective",
+    "incidence", "prognosis", "natural history",
+    "over time", "years", "months",
+]
+
+_CASE_CONTROL_KEYWORDS: List[str] = [
+    "case-control", "case control", "odds ratio", "risk factor",
+    "aetiology", "etiology", "cause", "causes", "rare disease",
+]
+
+_CROSS_SECTIONAL_KEYWORDS: List[str] = [
+    "prevalence", "cross-sectional", "cross sectional",
+    "survey", "point in time", "snapshot",
+    "burden", "frequency",
+]
+
+_SR_KEYWORDS: List[str] = [
+    "systematic review", "meta-analysis", "meta analysis",
+    "evidence synthesis", "pooled", "literature review",
+    "existing evidence", "review of",
+]
+
+
+# ===========================================================================
+# Internal helpers
+# ===========================================================================
 
 def _normalise(text: str) -> str:
     """Lower-case and collapse whitespace."""
     return re.sub(r"\s+", " ", text.lower().strip())
 
 
-def infer_framework_type(question: str) -> FrameworkType:
-    """
-    Deterministically infer whether a research question is PICO or PECO.
+def _score_keywords(text: str, keywords: List[str]) -> int:
+    normalised = _normalise(text)
+    return sum(1 for kw in keywords if kw in normalised)
 
-    Rules (applied in order — first match wins):
-    1. If exposure keywords outnumber intervention keywords → PECO.
-    2. Otherwise → PICO (most common clinical framework).
-    3. Empty question → UNKNOWN.
 
-    No-Invention Rule: decision is based solely on supplied question text.
-    """
-    if not question or not question.strip():
-        return FrameworkType.UNKNOWN
+def _make_task_id() -> str:
+    return str(uuid.uuid4())
 
-    normalised = _normalise(question)
 
-    exposure_score = sum(1 for kw in _EXPOSURE_KEYWORDS if kw in normalised)
-    intervention_score = sum(1 for kw in _INTERVENTION_KEYWORDS if kw in normalised)
-
-    if exposure_score > intervention_score:
-        return FrameworkType.PECO
-    return FrameworkType.PICO
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 # ---------------------------------------------------------------------------
-# Field extraction helpers
+# Field extraction helpers (No-Invention Rule: return "" on no match)
 # ---------------------------------------------------------------------------
 
 def _extract_population(question: str) -> str:
@@ -324,84 +401,36 @@ def _extract_exposure(question: str) -> str:
 
 
 # ===========================================================================
-# Public API — Framework Inference
+# 1. infer_framework_type
 # ===========================================================================
 
-def infer_pico(question: str) -> PICOFramework:
+def infer_framework_type(question: str) -> FrameworkType:
     """
-    Deterministically infer a PICOFramework from a research question string.
+    Deterministically infer whether a research question calls for PICO or
+    PECO structuring.
 
-    No-Invention Rule: only text present in *question* is used.
-    Missing elements are returned as empty strings, never fabricated.
-    """
-    return PICOFramework(
-        population=_extract_population(question),
-        intervention=_extract_intervention(question),
-        comparator=_extract_comparator(question),
-        outcome=_extract_outcome(question),
-        framework_type=FrameworkType.PICO,
-    )
+    Rules (first match wins):
+    1. Empty / blank question → UNKNOWN.
+    2. Exposure keyword score > intervention keyword score → PECO.
+    3. Otherwise → PICO (default for clinical intervention questions).
 
-
-def infer_peco(question: str) -> PECOFramework:
-    """
-    Deterministically infer a PECOFramework from a research question string.
-
-    No-Invention Rule: only text present in *question* is used.
-    """
-    return PECOFramework(
-        population=_extract_population(question),
-        exposure=_extract_exposure(question),
-        comparator=_extract_comparator(question),
-        outcome=_extract_outcome(question),
-        framework_type=FrameworkType.PECO,
-    )
-
-
-def infer_framework(question: str) -> ResearchFrameworkResult:
-    """
-    Top-level entry point: infer framework type and populate the appropriate
-    PICO or PECO structure from a free-text research question.
-
-    Returns a ResearchFrameworkResult containing the inferred framework,
-    a ValidationResult, and (where possible) a StudyDesignRecommendation.
+    No-Invention Rule: decision is based solely on the supplied text.
     """
     if not question or not question.strip():
-        return ResearchFrameworkResult(
-            framework_type=FrameworkType.UNKNOWN,
-            raw_question=question or "",
-            validation=ValidationResult(
-                status=ValidationStatus.INVALID,
-                errors=["Research question is empty."],
-            ),
-        )
+        return FrameworkType.UNKNOWN
 
-    framework_type = infer_framework_type(question)
+    normalised = _normalise(question)
+    exposure_score = sum(1 for kw in _EXPOSURE_KEYWORDS if kw in normalised)
+    intervention_score = sum(1 for kw in _INTERVENTION_KEYWORDS if kw in normalised)
 
-    if framework_type == FrameworkType.PECO:
-        peco = infer_peco(question)
-        validation = validate_peco(peco)
-        design = recommend_study_design_from_peco(peco) if validation.is_valid else None
-        return ResearchFrameworkResult(
-            framework_type=framework_type,
-            peco=peco,
-            validation=validation,
-            study_design=design,
-            raw_question=question,
-        )
+    if exposure_score > intervention_score:
+        return FrameworkType.PECO
+    return FrameworkType.PICO
 
-    # Default: PICO
-    pico = infer_pico(question)
-    validation = validate_pico(pico)
-    design = recommend_study_design_from_pico(pico) if validation.is_valid else None
-    return ResearchFrameworkResult(
-        framework_type=FrameworkType.PICO,
-        pico=pico,
-        validation=validation,
-        study_design=design,
-        raw_question=question,
-    )
 
+# ===========================================================================
+# 2. build_framework
+# ===========================================================================
 
 def build_framework(
     population: str = "",
@@ -415,33 +444,14 @@ def build_framework(
     raw_question: str = "",
 ) -> ResearchFrameworkResult:
     """
-    Build a ResearchFrameworkResult directly from explicit field values
-    rather than inferring them from free text.
+    Build a ResearchFrameworkResult directly from explicit field values.
 
     Caller supplies the structured elements; this function assembles,
     validates, and (where valid) recommends a study design.
 
     No-Invention Rule: no field value is fabricated. If a field is not
-    supplied it remains an empty string. Framework type is determined
-    from the presence of *exposure* vs *intervention* when not explicitly
-    provided.
-
-    Parameters
-    ----------
-    population      : Population / Participants element.
-    intervention    : Intervention element (PICO).
-    comparator      : Comparator / Control element.
-    outcome         : Outcome element.
-    exposure        : Exposure element (PECO). When non-empty and
-                      framework_type is not explicitly set, PECO is used.
-    framework_type  : Override the inferred FrameworkType.
-    time_horizon    : Optional time horizon string.
-    setting         : Optional study setting string.
-    raw_question    : Optional originating free-text question for provenance.
-
-    Returns
-    -------
-    ResearchFrameworkResult
+    supplied it remains an empty string. Framework type is determined from
+    the presence of *exposure* vs *intervention* when not explicitly given.
     """
     # Determine framework type
     if framework_type is None:
@@ -461,16 +471,24 @@ def build_framework(
             setting=setting,
         )
         validation = validate_peco(peco)
-        design = recommend_study_design_from_peco(peco) if validation.is_valid else None
+        design = (
+            recommend_study_design_from_peco(peco)
+            if validation.status != ValidationStatus.INVALID
+            else None
+        )
+        generated_q = build_research_question_from_peco(peco)
+        objectives = generate_research_objectives_from_peco(peco)
         return ResearchFrameworkResult(
             framework_type=FrameworkType.PECO,
             peco=peco,
             validation=validation,
             study_design=design,
             raw_question=raw_question,
+            generated_question=generated_q,
+            objectives=objectives,
         )
 
-    # PICO (default)
+    # Default: PICO
     pico = PICOFramework(
         population=population,
         intervention=intervention,
@@ -481,25 +499,118 @@ def build_framework(
         setting=setting,
     )
     validation = validate_pico(pico)
-    design = recommend_study_design_from_pico(pico) if validation.is_valid else None
+    design = (
+        recommend_study_design_from_pico(pico)
+        if validation.status != ValidationStatus.INVALID
+        else None
+    )
+    generated_q = build_research_question_from_pico(pico)
+    objectives = generate_research_objectives_from_pico(pico)
     return ResearchFrameworkResult(
         framework_type=FrameworkType.PICO,
         pico=pico,
         validation=validation,
         study_design=design,
         raw_question=raw_question,
+        generated_question=generated_q,
+        objectives=objectives,
     )
 
 
 # ===========================================================================
-# Validation Engine
+# 3. build_research_question
+# ===========================================================================
+
+def build_research_question(framework_result: ResearchFrameworkResult) -> str:
+    """
+    Generate a structured research question string from a
+    ResearchFrameworkResult.
+
+    Dispatches to PICO or PECO sub-builders based on framework type.
+    Returns an empty string if no framework data is present.
+
+    No-Invention Rule: the question is assembled only from fields that
+    are present in the supplied framework_result.
+    """
+    if framework_result.framework_type == FrameworkType.PECO and framework_result.peco:
+        return build_research_question_from_peco(framework_result.peco)
+    if framework_result.pico:
+        return build_research_question_from_pico(framework_result.pico)
+    return ""
+
+
+def build_research_question_from_pico(pico: PICOFramework) -> str:
+    """
+    Assemble a PICO research question from structured elements.
+
+    Template (elements omitted when empty):
+    'In [population], does [intervention] compared to [comparator]
+    improve/affect [outcome]?'
+    """
+    parts: List[str] = []
+
+    pop = pico.population.strip()
+    intv = pico.intervention.strip()
+    comp = pico.comparator.strip()
+    out = pico.outcome.strip()
+
+    if pop:
+        parts.append(f"In {pop}")
+    if intv and comp:
+        parts.append(f"does {intv} compared to {comp}")
+    elif intv:
+        parts.append(f"does {intv}")
+    if out:
+        parts.append(f"improve or affect {out}")
+
+    if not parts:
+        return ""
+
+    question = ", ".join(parts)
+    if not question.endswith("?"):
+        question += "?"
+    return question
+
+
+def build_research_question_from_peco(peco: PECOFramework) -> str:
+    """
+    Assemble a PECO research question from structured elements.
+
+    Template (elements omitted when empty):
+    'In [population], is exposure to [exposure] compared to [comparator]
+    associated with [outcome]?'
+    """
+    parts: List[str] = []
+
+    pop = peco.population.strip()
+    exp = peco.exposure.strip()
+    comp = peco.comparator.strip()
+    out = peco.outcome.strip()
+
+    if pop:
+        parts.append(f"In {pop}")
+    if exp and comp:
+        parts.append(f"is exposure to {exp} compared to {comp}")
+    elif exp:
+        parts.append(f"is exposure to {exp}")
+    if out:
+        parts.append(f"associated with {out}")
+
+    if not parts:
+        return ""
+
+    question = ", ".join(parts)
+    if not question.endswith("?"):
+        question += "?"
+    return question
+
+
+# ===========================================================================
+# 4. validate_framework  (+ internal PICO / PECO validators)
 # ===========================================================================
 
 def validate_pico(pico: PICOFramework) -> ValidationResult:
-    """
-    Validate a PICOFramework. Returns errors for missing mandatory fields
-    and warnings for fields that appear unusually short.
-    """
+    """Validate a PICOFramework against mandatory field rules."""
     errors: List[str] = []
     warnings: List[str] = []
     suggestions: List[str] = []
@@ -542,9 +653,7 @@ def validate_pico(pico: PICOFramework) -> ValidationResult:
 
 
 def validate_peco(peco: PECOFramework) -> ValidationResult:
-    """
-    Validate a PECOFramework.
-    """
+    """Validate a PECOFramework against mandatory field rules."""
     errors: List[str] = []
     warnings: List[str] = []
     suggestions: List[str] = []
@@ -590,6 +699,9 @@ def validate_framework(framework: ResearchFrameworkResult) -> ValidationResult:
     """
     Validate a ResearchFrameworkResult by dispatching to the appropriate
     PICO or PECO validator.
+
+    No-Invention Rule: validation is performed solely on the data present
+    in the supplied framework object.
     """
     if framework.framework_type == FrameworkType.PECO and framework.peco:
         return validate_peco(framework.peco)
@@ -602,153 +714,129 @@ def validate_framework(framework: ResearchFrameworkResult) -> ValidationResult:
 
 
 # ===========================================================================
-# Study Design Recommendation Engine
+# 5. generate_research_objectives
 # ===========================================================================
 
-_RCT_KEYWORDS = [
-    "randomized", "randomised", "rct", "trial", "placebo",
-    "blinded", "double-blind", "single-blind",
-    "treatment", "intervention", "drug", "therapy", "vaccine",
-    "efficacy", "effectiveness",
-]
-
-_COHORT_KEYWORDS = [
-    "cohort", "longitudinal", "follow-up", "follow up", "prospective",
-    "incidence", "prognosis", "natural history",
-    "over time", "years", "months",
-]
-
-_CASE_CONTROL_KEYWORDS = [
-    "case-control", "case control", "odds ratio", "risk factor",
-    "aetiology", "etiology", "cause", "causes", "rare disease",
-]
-
-_CROSS_SECTIONAL_KEYWORDS = [
-    "prevalence", "cross-sectional", "cross sectional",
-    "survey", "point in time", "snapshot",
-    "burden", "frequency",
-]
-
-_SR_KEYWORDS = [
-    "systematic review", "meta-analysis", "meta analysis",
-    "evidence synthesis", "pooled", "literature review",
-    "existing evidence", "review of",
-]
-
-
-def _score_keywords(text: str, keywords: List[str]) -> int:
-    normalised = _normalise(text)
-    return sum(1 for kw in keywords if kw in normalised)
-
-
-def recommend_study_design_from_pico(pico: PICOFramework) -> StudyDesignRecommendation:
+def generate_research_objectives(
+    framework_result: ResearchFrameworkResult,
+) -> List[str]:
     """
-    Recommend a study design deterministically from PICO elements.
+    Generate a deterministic list of research objectives from a
+    ResearchFrameworkResult.
 
-    Decision logic (deterministic scoring — no AI invention):
-    1. Combine all PICO text.
-    2. Score against keyword sets for each design type.
-    3. Select highest scorer; apply tie-breaking hierarchy:
-       RCT > Cohort > Case-Control > Cross-Sectional > Systematic Review.
-    4. Provide rationale and alternatives from actual PICO content.
+    Dispatches to PICO or PECO sub-generators.
+    Returns an empty list if no framework data is present.
+
+    No-Invention Rule: objectives reference only fields present in the
+    supplied framework_result.
     """
-    combined = " ".join([
-        pico.population, pico.intervention, pico.comparator, pico.outcome,
-        pico.time_horizon or "", pico.setting or "",
-    ])
-
-    scores = {
-        StudyDesign.RCT: _score_keywords(combined, _RCT_KEYWORDS),
-        StudyDesign.COHORT: _score_keywords(combined, _COHORT_KEYWORDS),
-        StudyDesign.CASE_CONTROL: _score_keywords(combined, _CASE_CONTROL_KEYWORDS),
-        StudyDesign.CROSS_SECTIONAL: _score_keywords(combined, _CROSS_SECTIONAL_KEYWORDS),
-        StudyDesign.SYSTEMATIC_REVIEW: _score_keywords(combined, _SR_KEYWORDS),
-    }
-
-    hierarchy = [
-        StudyDesign.RCT,
-        StudyDesign.COHORT,
-        StudyDesign.CASE_CONTROL,
-        StudyDesign.CROSS_SECTIONAL,
-        StudyDesign.SYSTEMATIC_REVIEW,
-    ]
-
-    best_design = max(hierarchy, key=lambda d: (scores[d], -hierarchy.index(d)))
-
-    if scores[best_design] == 0:
-        best_design = StudyDesign.RCT
-        confidence = "low"
-    else:
-        confidence = "high" if scores[best_design] >= 2 else "medium"
-
-    alternatives = [d for d in hierarchy if d != best_design and scores[d] > 0]
-
-    rationale = _build_pico_rationale(best_design, pico)
-    feasibility = _build_feasibility_notes(best_design)
-    ethical = _build_ethical_considerations(best_design)
-
-    return StudyDesignRecommendation(
-        recommended_design=best_design,
-        rationale=rationale,
-        alternatives=alternatives,
-        feasibility_notes=feasibility,
-        ethical_considerations=ethical,
-        confidence=confidence,
-    )
+    if framework_result.framework_type == FrameworkType.PECO and framework_result.peco:
+        return generate_research_objectives_from_peco(framework_result.peco)
+    if framework_result.pico:
+        return generate_research_objectives_from_pico(framework_result.pico)
+    return []
 
 
-def recommend_study_design_from_peco(peco: PECOFramework) -> StudyDesignRecommendation:
+def generate_research_objectives_from_pico(pico: PICOFramework) -> List[str]:
     """
-    Recommend a study design deterministically from PECO elements.
+    Generate structured research objectives from PICO elements.
 
-    For exposure questions the hierarchy shifts toward observational designs.
+    Only objectives whose constituent fields are non-empty are included.
+    No fields are invented.
     """
-    combined = " ".join([
-        peco.population, peco.exposure, peco.comparator, peco.outcome,
-        peco.time_horizon or "", peco.setting or "",
-    ])
+    objectives: List[str] = []
 
-    scores = {
-        StudyDesign.COHORT: _score_keywords(combined, _COHORT_KEYWORDS),
-        StudyDesign.CASE_CONTROL: _score_keywords(combined, _CASE_CONTROL_KEYWORDS),
-        StudyDesign.CROSS_SECTIONAL: _score_keywords(combined, _CROSS_SECTIONAL_KEYWORDS),
-        StudyDesign.SYSTEMATIC_REVIEW: _score_keywords(combined, _SR_KEYWORDS),
-        StudyDesign.RCT: _score_keywords(combined, _RCT_KEYWORDS),
-    }
+    pop = pico.population.strip()
+    intv = pico.intervention.strip()
+    comp = pico.comparator.strip()
+    out = pico.outcome.strip()
 
-    hierarchy = [
-        StudyDesign.COHORT,
-        StudyDesign.CASE_CONTROL,
-        StudyDesign.CROSS_SECTIONAL,
-        StudyDesign.SYSTEMATIC_REVIEW,
-        StudyDesign.RCT,
-    ]
+    if pop and intv and out:
+        objectives.append(
+            f"To evaluate the effect of {intv} on {out}"
+            + (f" in {pop}" if pop else "")
+            + "."
+        )
 
-    best_design = max(hierarchy, key=lambda d: (scores[d], -hierarchy.index(d)))
+    if intv and comp and out:
+        objectives.append(
+            f"To compare {intv} with {comp} in terms of {out}."
+        )
 
-    if scores[best_design] == 0:
-        best_design = StudyDesign.COHORT
-        confidence = "low"
-    else:
-        confidence = "high" if scores[best_design] >= 2 else "medium"
+    if pop and out:
+        objectives.append(
+            f"To assess {out} outcomes among {pop}."
+        )
 
-    alternatives = [d for d in hierarchy if d != best_design and scores[d] > 0]
+    if pico.time_horizon and intv and out:
+        objectives.append(
+            f"To measure {out} following {intv} over {pico.time_horizon}."
+        )
 
-    rationale = _build_peco_rationale(best_design, peco)
-    feasibility = _build_feasibility_notes(best_design)
-    ethical = _build_ethical_considerations(best_design)
+    if not objectives and (pop or intv or out):
+        # Minimal fallback — still grounded in supplied data
+        elements = [x for x in [intv, out, pop] if x]
+        objectives.append(
+            "To investigate " + ", ".join(elements) + "."
+        )
 
-    return StudyDesignRecommendation(
-        recommended_design=best_design,
-        rationale=rationale,
-        alternatives=alternatives,
-        feasibility_notes=feasibility,
-        ethical_considerations=ethical,
-        confidence=confidence,
-    )
+    return objectives
 
 
-def recommend_study_design(framework: ResearchFrameworkResult) -> StudyDesignRecommendation:
+def generate_research_objectives_from_peco(peco: PECOFramework) -> List[str]:
+    """
+    Generate structured research objectives from PECO elements.
+
+    Only objectives whose constituent fields are non-empty are included.
+    No fields are invented.
+    """
+    objectives: List[str] = []
+
+    pop = peco.population.strip()
+    exp = peco.exposure.strip()
+    comp = peco.comparator.strip()
+    out = peco.outcome.strip()
+
+    if pop and exp and out:
+        objectives.append(
+            f"To determine the association between {exp} and {out}"
+            + (f" in {pop}" if pop else "")
+            + "."
+        )
+
+    if exp and comp and out:
+        objectives.append(
+            f"To compare {out} between individuals exposed to {exp} "
+            f"and those exposed to {comp}."
+        )
+
+    if pop and out:
+        objectives.append(
+            f"To estimate the incidence / prevalence of {out} in {pop}."
+        )
+
+    if peco.time_horizon and exp and out:
+        objectives.append(
+            f"To assess the longitudinal relationship between {exp} and {out} "
+            f"over {peco.time_horizon}."
+        )
+
+    if not objectives and (pop or exp or out):
+        elements = [x for x in [exp, out, pop] if x]
+        objectives.append(
+            "To investigate " + ", ".join(elements) + "."
+        )
+
+    return objectives
+
+
+# ===========================================================================
+# 6. recommend_study_design  (+ internal PICO / PECO recommenders)
+# ===========================================================================
+
+def recommend_study_design(
+    framework: ResearchFrameworkResult,
+) -> StudyDesignRecommendation:
     """
     Recommend a study design from a ResearchFrameworkResult by dispatching
     to the appropriate PICO or PECO recommender.
@@ -767,11 +855,108 @@ def recommend_study_design(framework: ResearchFrameworkResult) -> StudyDesignRec
     )
 
 
+def recommend_study_design_from_pico(pico: PICOFramework) -> StudyDesignRecommendation:
+    """
+    Recommend a study design deterministically from PICO elements.
+
+    Scoring: each design type accumulates points for matching keywords
+    found in the combined PICO text. Tie-breaking follows the hierarchy:
+    RCT > Cohort > Case-Control > Cross-Sectional > Systematic Review.
+    """
+    combined = " ".join([
+        pico.population, pico.intervention, pico.comparator, pico.outcome,
+        pico.time_horizon or "", pico.setting or "",
+    ])
+
+    hierarchy = [
+        StudyDesign.RCT,
+        StudyDesign.COHORT,
+        StudyDesign.CASE_CONTROL,
+        StudyDesign.CROSS_SECTIONAL,
+        StudyDesign.SYSTEMATIC_REVIEW,
+    ]
+    keyword_map = {
+        StudyDesign.RCT: _RCT_KEYWORDS,
+        StudyDesign.COHORT: _COHORT_KEYWORDS,
+        StudyDesign.CASE_CONTROL: _CASE_CONTROL_KEYWORDS,
+        StudyDesign.CROSS_SECTIONAL: _CROSS_SECTIONAL_KEYWORDS,
+        StudyDesign.SYSTEMATIC_REVIEW: _SR_KEYWORDS,
+    }
+    scores = {d: _score_keywords(combined, keyword_map[d]) for d in hierarchy}
+    best = max(hierarchy, key=lambda d: (scores[d], -hierarchy.index(d)))
+
+    if scores[best] == 0:
+        best = StudyDesign.RCT
+        confidence = "low"
+    else:
+        confidence = "high" if scores[best] >= 2 else "medium"
+
+    alternatives = [d for d in hierarchy if d != best and scores[d] > 0]
+
+    return StudyDesignRecommendation(
+        recommended_design=best,
+        rationale=_build_pico_rationale(best, pico),
+        alternatives=alternatives,
+        feasibility_notes=_build_feasibility_notes(best),
+        ethical_considerations=_build_ethical_considerations(best),
+        confidence=confidence,
+    )
+
+
+def recommend_study_design_from_peco(peco: PECOFramework) -> StudyDesignRecommendation:
+    """
+    Recommend a study design deterministically from PECO elements.
+
+    For exposure questions the hierarchy shifts toward observational designs.
+    """
+    combined = " ".join([
+        peco.population, peco.exposure, peco.comparator, peco.outcome,
+        peco.time_horizon or "", peco.setting or "",
+    ])
+
+    hierarchy = [
+        StudyDesign.COHORT,
+        StudyDesign.CASE_CONTROL,
+        StudyDesign.CROSS_SECTIONAL,
+        StudyDesign.SYSTEMATIC_REVIEW,
+        StudyDesign.RCT,
+    ]
+    keyword_map = {
+        StudyDesign.COHORT: _COHORT_KEYWORDS,
+        StudyDesign.CASE_CONTROL: _CASE_CONTROL_KEYWORDS,
+        StudyDesign.CROSS_SECTIONAL: _CROSS_SECTIONAL_KEYWORDS,
+        StudyDesign.SYSTEMATIC_REVIEW: _SR_KEYWORDS,
+        StudyDesign.RCT: _RCT_KEYWORDS,
+    }
+    scores = {d: _score_keywords(combined, keyword_map[d]) for d in hierarchy}
+    best = max(hierarchy, key=lambda d: (scores[d], -hierarchy.index(d)))
+
+    if scores[best] == 0:
+        best = StudyDesign.COHORT
+        confidence = "low"
+    else:
+        confidence = "high" if scores[best] >= 2 else "medium"
+
+    alternatives = [d for d in hierarchy if d != best and scores[d] > 0]
+
+    return StudyDesignRecommendation(
+        recommended_design=best,
+        rationale=_build_peco_rationale(best, peco),
+        alternatives=alternatives,
+        feasibility_notes=_build_feasibility_notes(best),
+        ethical_considerations=_build_ethical_considerations(best),
+        confidence=confidence,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Rationale / feasibility / ethics builders
+# ---------------------------------------------------------------------------
+
 def _build_pico_rationale(design: StudyDesign, pico: PICOFramework) -> str:
     pop = pico.population or "the specified population"
     intv = pico.intervention or "the intervention"
     out = pico.outcome or "the outcome"
-
     rationales = {
         StudyDesign.RCT: (
             f"A Randomised Controlled Trial is recommended to evaluate the effect of "
@@ -802,7 +987,6 @@ def _build_peco_rationale(design: StudyDesign, peco: PECOFramework) -> str:
     pop = peco.population or "the specified population"
     exp = peco.exposure or "the exposure"
     out = peco.outcome or "the outcome"
-
     rationales = {
         StudyDesign.COHORT: (
             f"A Cohort Study is recommended to follow {pop} with and without "
@@ -829,7 +1013,7 @@ def _build_peco_rationale(design: StudyDesign, peco: PECOFramework) -> str:
 
 
 def _build_feasibility_notes(design: StudyDesign) -> List[str]:
-    notes = {
+    notes: Dict[StudyDesign, List[str]] = {
         StudyDesign.RCT: [
             "Requires ethical approval and informed consent.",
             "May require substantial sample size and funding.",
@@ -860,7 +1044,7 @@ def _build_feasibility_notes(design: StudyDesign) -> List[str]:
 
 
 def _build_ethical_considerations(design: StudyDesign) -> List[str]:
-    considerations = {
+    considerations: Dict[StudyDesign, List[str]] = {
         StudyDesign.RCT: [
             "Equipoise must exist between arms.",
             "Participant randomisation requires full informed consent.",
@@ -887,23 +1071,32 @@ def _build_ethical_considerations(design: StudyDesign) -> List[str]:
 
 
 # ===========================================================================
-# State Gate Evaluation
+# 7. check_question_defined_ready
 # ===========================================================================
 
-def evaluate_framework_gate(
+def check_question_defined_ready(
     framework_result: ResearchFrameworkResult,
+    *,
+    raise_on_fail: bool = False,
 ) -> Tuple[bool, List[str]]:
     """
-    Evaluate whether a ResearchFrameworkResult meets the gate criteria
-    required to advance to the next research phase.
-
-    Returns:
-        (passed: bool, reasons: List[str])
+    State gate: determine whether the research question is sufficiently
+    defined to advance from the QUESTION_DEFINED phase.
 
     Gate criteria:
     - Framework type must not be UNKNOWN.
-    - Validation status must be VALID or INCOMPLETE (not INVALID).
-    - At least Population and Outcome must be non-empty.
+    - Validation status must not be INVALID.
+    - Population and Outcome must both be non-empty.
+    - A generated or raw research question must be present.
+
+    Parameters
+    ----------
+    framework_result : ResearchFrameworkResult to evaluate.
+    raise_on_fail    : If True, raises StateGateError on failure.
+
+    Returns
+    -------
+    (passed: bool, reasons: List[str])
 
     No-Invention Rule: gate decisions are based solely on the content
     of framework_result; nothing is assumed or fabricated.
@@ -914,47 +1107,425 @@ def evaluate_framework_gate(
         reasons.append(
             "Framework type could not be determined from the research question."
         )
-        return False, reasons
 
     if framework_result.validation is None:
         reasons.append("Validation has not been performed.")
-        return False, reasons
-
-    if framework_result.validation.status == ValidationStatus.INVALID:
+    elif framework_result.validation.status == ValidationStatus.INVALID:
         reasons.append("Framework validation failed.")
         reasons.extend(framework_result.validation.errors)
-        return False, reasons
 
+    # Check population and outcome
     if framework_result.framework_type == FrameworkType.PECO and framework_result.peco:
         if not framework_result.peco.population.strip():
-            reasons.append("Population is required to advance.")
-            return False, reasons
+            reasons.append("Population (P) is required to advance.")
         if not framework_result.peco.outcome.strip():
-            reasons.append("Outcome is required to advance.")
-            return False, reasons
+            reasons.append("Outcome (O) is required to advance.")
     elif framework_result.pico:
         if not framework_result.pico.population.strip():
-            reasons.append("Population is required to advance.")
-            return False, reasons
+            reasons.append("Population (P) is required to advance.")
         if not framework_result.pico.outcome.strip():
-            reasons.append("Outcome is required to advance.")
-            return False, reasons
+            reasons.append("Outcome (O) is required to advance.")
     else:
         reasons.append("No PICO or PECO framework data present.")
-        return False, reasons
 
-    return True, reasons
+    # A question string must be present
+    question_text = (
+        framework_result.generated_question or framework_result.raw_question
+    ).strip()
+    if not question_text:
+        reasons.append(
+            "No research question text is present. "
+            "Call build_research_question() to generate one."
+        )
+
+    passed = len(reasons) == 0
+
+    if not passed and raise_on_fail:
+        raise StateGateError(
+            "check_question_defined_ready gate failed: " + "; ".join(reasons)
+        )
+
+    return passed, reasons
+
+
+# ===========================================================================
+# 8. check_design_selected_ready
+# ===========================================================================
+
+def check_design_selected_ready(
+    framework_result: ResearchFrameworkResult,
+    *,
+    raise_on_fail: bool = False,
+) -> Tuple[bool, List[str]]:
+    """
+    State gate: determine whether a study design has been selected and the
+    project is ready to advance to the LITERATURE_SEARCH phase.
+
+    Gate criteria:
+    - check_question_defined_ready must pass.
+    - A StudyDesignRecommendation must be present.
+    - recommended_design must not be UNKNOWN.
+    - rationale must be non-empty.
+
+    Parameters
+    ----------
+    framework_result : ResearchFrameworkResult to evaluate.
+    raise_on_fail    : If True, raises StateGateError on failure.
+
+    Returns
+    -------
+    (passed: bool, reasons: List[str])
+    """
+    reasons: List[str] = []
+
+    # First gate must pass
+    question_ok, question_reasons = check_question_defined_ready(framework_result)
+    if not question_ok:
+        reasons.extend(question_reasons)
+
+    # Study design checks
+    if framework_result.study_design is None:
+        reasons.append("No study design recommendation has been generated.")
+    else:
+        if framework_result.study_design.recommended_design == StudyDesign.UNKNOWN:
+            reasons.append(
+                "Study design is UNKNOWN; a specific design must be selected."
+            )
+        if not framework_result.study_design.rationale.strip():
+            reasons.append("Study design rationale is missing.")
+
+    passed = len(reasons) == 0
+
+    if not passed and raise_on_fail:
+        raise StateGateError(
+            "check_design_selected_ready gate failed: " + "; ".join(reasons)
+        )
+
+    return passed, reasons
+
+
+# ===========================================================================
+# 9. generate_framework_tasks
+# ===========================================================================
+
+def generate_framework_tasks(
+    framework_result: ResearchFrameworkResult,
+) -> List[FrameworkTask]:
+    """
+    Generate an ordered list of actionable FrameworkTasks from a
+    ResearchFrameworkResult.
+
+    Tasks are determined deterministically from the state of the framework:
+    - Missing fields generate tasks to complete them.
+    - Incomplete validation generates a review task.
+    - Absence of a study design generates a selection task.
+    - Absence of a research question generates a generation task.
+    - Absence of objectives generates an objectives task.
+
+    No-Invention Rule: task descriptions reference only fields actually
+    present or absent in the supplied framework_result. No external
+    knowledge is introduced.
+
+    Returns
+    -------
+    List[FrameworkTask] ordered by priority (1 = highest).
+    """
+    tasks: List[FrameworkTask] = []
+    priority = 1
+
+    ft = framework_result.framework_type
+
+    # -----------------------------------------------------------------------
+    # Task: complete missing framework fields
+    # -----------------------------------------------------------------------
+    missing_fields: List[str] = []
+
+    if ft == FrameworkType.PECO and framework_result.peco:
+        peco = framework_result.peco
+        if not peco.population.strip():
+            missing_fields.append("Population (P)")
+        if not peco.exposure.strip():
+            missing_fields.append("Exposure (E)")
+        if not peco.comparator.strip():
+            missing_fields.append("Comparator (C)")
+        if not peco.outcome.strip():
+            missing_fields.append("Outcome (O)")
+    elif framework_result.pico:
+        pico = framework_result.pico
+        if not pico.population.strip():
+            missing_fields.append("Population (P)")
+        if not pico.intervention.strip():
+            missing_fields.append("Intervention (I)")
+        if not pico.comparator.strip():
+            missing_fields.append("Comparator (C)")
+        if not pico.outcome.strip():
+            missing_fields.append("Outcome (O)")
+    else:
+        missing_fields.append("all framework fields (no PICO/PECO data present)")
+
+    if missing_fields:
+        tasks.append(FrameworkTask(
+            task_id=_make_task_id(),
+            title="Complete framework fields",
+            description=(
+                f"The following {ft.value} framework elements are missing and must "
+                f"be supplied before the project can advance: "
+                + ", ".join(missing_fields) + "."
+            ),
+            phase="framework",
+            status=TaskStatus.PENDING,
+            priority=priority,
+            metadata={"missing_fields": missing_fields},
+        ))
+        priority += 1
+
+    # -----------------------------------------------------------------------
+    # Task: resolve validation errors
+    # -----------------------------------------------------------------------
+    if (
+        framework_result.validation
+        and framework_result.validation.status == ValidationStatus.INVALID
+    ):
+        tasks.append(FrameworkTask(
+            task_id=_make_task_id(),
+            title="Resolve framework validation errors",
+            description=(
+                "The framework has failed validation. "
+                "Errors to resolve: "
+                + "; ".join(framework_result.validation.errors) + "."
+            ),
+            phase="framework",
+            status=TaskStatus.PENDING,
+            priority=priority,
+            metadata={"errors": framework_result.validation.errors},
+        ))
+        priority += 1
+
+    # -----------------------------------------------------------------------
+    # Task: address validation warnings
+    # -----------------------------------------------------------------------
+    if (
+        framework_result.validation
+        and framework_result.validation.warnings
+        and framework_result.validation.status != ValidationStatus.INVALID
+    ):
+        tasks.append(FrameworkTask(
+            task_id=_make_task_id(),
+            title="Review framework validation warnings",
+            description=(
+                "The framework has warnings that should be reviewed: "
+                + "; ".join(framework_result.validation.warnings) + "."
+            ),
+            phase="framework",
+            status=TaskStatus.PENDING,
+            priority=priority,
+            metadata={"warnings": framework_result.validation.warnings},
+        ))
+        priority += 1
+
+    # -----------------------------------------------------------------------
+    # Task: generate research question
+    # -----------------------------------------------------------------------
+    question_text = (
+        framework_result.generated_question or framework_result.raw_question
+    ).strip()
+    if not question_text:
+        tasks.append(FrameworkTask(
+            task_id=_make_task_id(),
+            title="Generate structured research question",
+            description=(
+                f"No research question has been generated for this "
+                f"{ft.value} framework. "
+                "Call build_research_question() to produce a structured question."
+            ),
+            phase="framework",
+            status=TaskStatus.PENDING,
+            priority=priority,
+            metadata={},
+        ))
+        priority += 1
+
+    # -----------------------------------------------------------------------
+    # Task: generate research objectives
+    # -----------------------------------------------------------------------
+    if not framework_result.objectives:
+        tasks.append(FrameworkTask(
+            task_id=_make_task_id(),
+            title="Generate research objectives",
+            description=(
+                "No research objectives have been defined. "
+                "Call generate_research_objectives() to produce a structured "
+                "objective list from the framework elements."
+            ),
+            phase="framework",
+            status=TaskStatus.PENDING,
+            priority=priority,
+            metadata={},
+        ))
+        priority += 1
+
+    # -----------------------------------------------------------------------
+    # Task: select study design
+    # -----------------------------------------------------------------------
+    if framework_result.study_design is None:
+        tasks.append(FrameworkTask(
+            task_id=_make_task_id(),
+            title="Select study design",
+            description=(
+                "No study design has been recommended or selected. "
+                "Call recommend_study_design() to receive a deterministic "
+                "recommendation based on the current framework."
+            ),
+            phase="framework",
+            status=TaskStatus.PENDING,
+            priority=priority,
+            metadata={},
+        ))
+        priority += 1
+    elif framework_result.study_design.recommended_design == StudyDesign.UNKNOWN:
+        tasks.append(FrameworkTask(
+            task_id=_make_task_id(),
+            title="Confirm study design selection",
+            description=(
+                "The study design is currently UNKNOWN. "
+                "Complete the framework fields so that a specific design "
+                "can be recommended deterministically."
+            ),
+            phase="framework",
+            status=TaskStatus.PENDING,
+            priority=priority,
+            metadata={},
+        ))
+        priority += 1
+
+    # -----------------------------------------------------------------------
+    # Task: advance to literature search (all gates passed)
+    # -----------------------------------------------------------------------
+    design_ok, _ = check_design_selected_ready(framework_result)
+    if design_ok:
+        tasks.append(FrameworkTask(
+            task_id=_make_task_id(),
+            title="Advance to literature search phase",
+            description=(
+                "All framework gates have passed. The project is ready to "
+                "advance to the Literature Search phase. Initiate the "
+                "literature search strategy engine."
+            ),
+            phase="framework",
+            status=TaskStatus.PENDING,
+            priority=priority,
+            metadata={"gate": "design_selected_ready", "gate_passed": True},
+        ))
+
+    return tasks
+
+
+# ===========================================================================
+# Convenience / Integration Functions
+# ===========================================================================
+
+def infer_framework(question: str) -> ResearchFrameworkResult:
+    """
+    Top-level entry point: infer framework type and populate the appropriate
+    PICO or PECO structure from a free-text research question.
+
+    Returns a ResearchFrameworkResult containing the inferred framework,
+    a ValidationResult, generated research question, objectives, and
+    (where valid) a StudyDesignRecommendation.
+    """
+    if not question or not question.strip():
+        return ResearchFrameworkResult(
+            framework_type=FrameworkType.UNKNOWN,
+            raw_question=question or "",
+            validation=ValidationResult(
+                status=ValidationStatus.INVALID,
+                errors=["Research question is empty."],
+            ),
+        )
+
+    framework_type = infer_framework_type(question)
+
+    if framework_type == FrameworkType.PECO:
+        peco = PECOFramework(
+            population=_extract_population(question),
+            exposure=_extract_exposure(question),
+            comparator=_extract_comparator(question),
+            outcome=_extract_outcome(question),
+            framework_type=FrameworkType.PECO,
+        )
+        validation = validate_peco(peco)
+        design = (
+            recommend_study_design_from_peco(peco)
+            if validation.status != ValidationStatus.INVALID
+            else None
+        )
+        generated_q = build_research_question_from_peco(peco)
+        objectives = generate_research_objectives_from_peco(peco)
+        return ResearchFrameworkResult(
+            framework_type=FrameworkType.PECO,
+            peco=peco,
+            validation=validation,
+            study_design=design,
+            raw_question=question,
+            generated_question=generated_q,
+            objectives=objectives,
+        )
+
+    # Default: PICO
+    pico = PICOFramework(
+        population=_extract_population(question),
+        intervention=_extract_intervention(question),
+        comparator=_extract_comparator(question),
+        outcome=_extract_outcome(question),
+        framework_type=FrameworkType.PICO,
+    )
+    validation = validate_pico(pico)
+    design = (
+        recommend_study_design_from_pico(pico)
+        if validation.status != ValidationStatus.INVALID
+        else None
+    )
+    generated_q = build_research_question_from_pico(pico)
+    objectives = generate_research_objectives_from_pico(pico)
+    return ResearchFrameworkResult(
+        framework_type=FrameworkType.PICO,
+        pico=pico,
+        validation=validation,
+        study_design=design,
+        raw_question=question,
+        generated_question=generated_q,
+        objectives=objectives,
+    )
+
+
+def process_research_question(question: str) -> ResearchFrameworkResult:
+    """
+    Full pipeline alias for infer_framework().
+
+    Primary integration entry point for external callers
+    (UI, task engine, persistence layer).
+    """
+    return infer_framework(question)
+
+
+def evaluate_framework_gate(
+    framework_result: ResearchFrameworkResult,
+) -> Tuple[bool, List[str]]:
+    """
+    Alias for check_question_defined_ready() retained for backward
+    compatibility with Sprint 2 callers.
+    """
+    return check_question_defined_ready(framework_result)
 
 
 def evaluate_design_gate(
     recommendation: Optional[StudyDesignRecommendation],
 ) -> Tuple[bool, List[str]]:
     """
-    Evaluate whether a StudyDesignRecommendation meets the gate criteria
-    required to advance to literature search phase.
+    Evaluate whether a standalone StudyDesignRecommendation satisfies the
+    design gate (backward-compatible helper).
 
-    Returns:
-        (passed: bool, reasons: List[str])
+    Returns (passed, reasons).
     """
     reasons: List[str] = []
 
@@ -963,7 +1534,9 @@ def evaluate_design_gate(
         return False, reasons
 
     if recommendation.recommended_design == StudyDesign.UNKNOWN:
-        reasons.append("Study design could not be determined.")
+        reasons.append(
+            "Study design is UNKNOWN; a specific design must be selected."
+        )
         return False, reasons
 
     if not recommendation.rationale.strip():
@@ -973,29 +1546,12 @@ def evaluate_design_gate(
     return True, reasons
 
 
-# ===========================================================================
-# Convenience / Integration Functions
-# ===========================================================================
-
-def process_research_question(question: str) -> ResearchFrameworkResult:
-    """
-    Full pipeline: infer framework → validate → recommend design.
-
-    This is the primary integration entry point for external callers
-    (UI, task engine, persistence layer).
-
-    No-Invention Rule: all outputs derive from *question* only.
-    """
-    return infer_framework(question)
-
-
 def get_framework_summary(result: ResearchFrameworkResult) -> str:
     """
     Return a human-readable summary of a ResearchFrameworkResult.
     Used by the UI and reporting layer.
     """
     lines: List[str] = []
-
     lines.append(f"Framework Type: {result.framework_type.value}")
 
     if result.framework_type == FrameworkType.PICO and result.pico:
@@ -1004,13 +1560,20 @@ def get_framework_summary(result: ResearchFrameworkResult) -> str:
         lines.append(f"  Intervention: {p.intervention or '(not identified)'}")
         lines.append(f"  Comparator  : {p.comparator or '(not identified)'}")
         lines.append(f"  Outcome     : {p.outcome or '(not identified)'}")
-
     elif result.framework_type == FrameworkType.PECO and result.peco:
         p = result.peco
         lines.append(f"  Population  : {p.population or '(not identified)'}")
         lines.append(f"  Exposure    : {p.exposure or '(not identified)'}")
         lines.append(f"  Comparator  : {p.comparator or '(not identified)'}")
         lines.append(f"  Outcome     : {p.outcome or '(not identified)'}")
+
+    if result.generated_question:
+        lines.append(f"Research Question: {result.generated_question}")
+
+    if result.objectives:
+        lines.append("Objectives:")
+        for obj in result.objectives:
+            lines.append(f"  - {obj}")
 
     if result.validation:
         lines.append(f"Validation: {result.validation.status.value}")
@@ -1023,13 +1586,14 @@ def get_framework_summary(result: ResearchFrameworkResult) -> str:
         lines.append(
             f"Recommended Design: {result.study_design.recommended_design.value}"
         )
-        lines.append(f"  Rationale: {result.study_design.rationale}")
+        lines.append(f"  Rationale : {result.study_design.rationale}")
+        lines.append(f"  Confidence: {result.study_design.confidence}")
 
     return "\n".join(lines)
 
 
 # ===========================================================================
-# Public re-exports — everything the test suite may import by name
+# Public re-exports
 # ===========================================================================
 
 __all__ = [
@@ -1037,27 +1601,35 @@ __all__ = [
     "FrameworkType",
     "StudyDesign",
     "ValidationStatus",
+    "TaskStatus",
     # Data containers
     "PICOFramework",
     "PECOFramework",
     "ValidationResult",
     "StudyDesignRecommendation",
     "ResearchFrameworkResult",
-    # Inference
+    "FrameworkTask",
+    # Core public API (9 required functions)
     "infer_framework_type",
+    "build_framework",
+    "build_research_question",
+    "validate_framework",
+    "generate_research_objectives",
+    "recommend_study_design",
+    "check_question_defined_ready",
+    "check_design_selected_ready",
+    "generate_framework_tasks",
+    # Supporting inference
+    "infer_framework",
     "infer_pico",
     "infer_peco",
-    "infer_framework",
-    "build_framework",
-    # Validation
+    # Supporting validators
     "validate_pico",
     "validate_peco",
-    "validate_framework",
-    # Study design
-    "recommend_study_design",
+    # Supporting recommenders
     "recommend_study_design_from_pico",
     "recommend_study_design_from_peco",
-    # Gate evaluation
+    # Backward-compatible gate helpers
     "evaluate_framework_gate",
     "evaluate_design_gate",
     # Convenience
