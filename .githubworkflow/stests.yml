@@ -1,4 +1,4 @@
-name: Tests
+name: CI
 
 on:
   push:
@@ -25,14 +25,12 @@ jobs:
           pip install -r requirements.txt
           pip install pytest
 
-      - name: Run pytest
+      - name: Run tests
         env:
-          PYTHONPATH: .
-        run: |
-          python -m pytest tests/ -v
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m pytest tests/ -v
 
       - name: Run smoke test
         env:
-          PYTHONPATH: .
-        run: |
-          python smoke_test.py
+          PYTHONPATH: ${{ github.workspace }}
+        run: python smoke_test.py
