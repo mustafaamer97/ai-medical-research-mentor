@@ -22,16 +22,12 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pytest
-          python -m pip install -r requirements.txt
-
-      - name: Verify pytest
-        run: |
-          python -m pytest --version
+          pip install -r requirements.txt
+          pip install pytest
 
       - name: Run pytest
         run: |
-          python -m pytest tests/ -v
+          python -m pytest -v
 
       - name: Run smoke test
         run: |
