@@ -6,9 +6,10 @@ Sprint 1 / Sprint 2 / Sprint 3 — State Machine & Gate Validation Engine
 Provides:
 - ResearchState enumeration (all project lifecycle states)
 - all_states_in_order (canonical ordered sequence of ResearchState values)
-- state_progress_index() (Sprint 1 compatibility: zero-based position in lifecycle)
-- get_valid_next_states() (query valid transitions from a given state)
-- is_valid_transition() (topology query)
+- state_progress_index() (Sprint 1: zero-based position in lifecycle)
+- validate_transition() (Sprint 1: validate a transition, raise on failure)
+- get_valid_next_states() (Sprint 2: query valid transitions from a state)
+- is_valid_transition() (topology boolean query)
 - StateGateError (raised when a gate check blocks a transition)
 - InvalidStateTransitionError (raised for illegal state transitions)
 - transition_state() (unconditional state transition with audit)
@@ -109,7 +110,7 @@ class InvalidStateTransitionError(Exception):
     def __str__(self) -> str:
         return (
             f"{self.message} "
-            f"(from={self.from_state!r} \u2192 to={self.to_state!r})"
+            f"(from={self.from_state!r} -> to={self.to_state!r})"
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -183,60 +184,6 @@ all_states_in_order: List[ResearchState] = [
 
 
 # ===========================================================================
-# Sprint 1 Public Helper: state_progress_index
-# ===========================================================================
-
-def state_progress_index(state: Any) -> int:
-    """
-    Return the zero-based position of *state* in the ordered research
-    lifecycle (``all_states_in_order``).
-
-    This is the Sprint 1 public helper preserved for full backward
-    compatibility.  It is the authoritative implementation; the
-    ``StateManager.state_index()`` method delegates to this function.
-
-    Parameters
-    ----------
-    state : ResearchState, str, or any value coercible to ResearchState.
-
-    Returns
-    -------
-    int
-        Zero-based index of the state in ``all_states_in_order``.
-        Returns -1 for terminal / recovery states that are not part of
-        the linear sequence (ARCHIVED, ERROR) and for any unrecognised
-        value.
-
-    Examples
-    --------
-    >>> state_progress_index(ResearchState.DRAFT)
-    0
-    >>> state_progress_index("question_defined")
-    1
-    >>> state_progress_index(ResearchState.COMPLETE)
-    9
-    >>> state_progress_index(ResearchState.ARCHIVED)
-    -1
-    >>> state_progress_index(ResearchState.ERROR)
-    -1
-    >>> state_progress_index("unknown_value")
-    -1
-
-    No-Invention Rule: the index is derived solely from the statically
-    defined ``all_states_in_order`` list; no runtime data is consulted.
-    """
-    try:
-        coerced = _coerce_state(state)
-    except ValueError:
-        return -1
-
-    try:
-        return all_states_in_order.index(coerced)
-    except ValueError:
-        return -1
-
-
-# ===========================================================================
 # State Machine Topology
 # ===========================================================================
 
@@ -305,61 +252,6 @@ ALLOWED_TRANSITIONS: Dict[ResearchState, List[ResearchState]] = {
 
 
 # ===========================================================================
-# Public Query Functions
-# ===========================================================================
-
-def get_valid_next_states(current_state: Any) -> List[ResearchState]:
-    """
-    Return the ordered list of ResearchState values that are valid
-    transition targets from *current_state*, as defined by the Sprint 2
-    ALLOWED_TRANSITIONS topology.
-
-    Parameters
-    ----------
-    current_state : ResearchState or coercible value.
-
-    Returns
-    -------
-    List[ResearchState]
-        Ordered list of permitted next states.  Returns an empty list for
-        terminal states (e.g. ARCHIVED) or unrecognised inputs.
-
-    No-Invention Rule: the returned list is derived solely from the
-    statically defined ALLOWED_TRANSITIONS map; no runtime data is
-    consulted.
-    """
-    try:
-        state = _coerce_state(current_state)
-    except ValueError:
-        return []
-    return list(ALLOWED_TRANSITIONS.get(state, []))
-
-
-def is_valid_transition(from_state: Any, to_state: Any) -> bool:
-    """
-    Return True if a direct transition from *from_state* to *to_state*
-    is permitted by the ALLOWED_TRANSITIONS topology.
-
-    Parameters
-    ----------
-    from_state : ResearchState or coercible value.
-    to_state   : ResearchState or coercible value.
-
-    Returns
-    -------
-    bool
-
-    No-Invention Rule: result is derived solely from ALLOWED_TRANSITIONS.
-    """
-    try:
-        src = _coerce_state(from_state)
-        tgt = _coerce_state(to_state)
-    except ValueError:
-        return False
-    return tgt in ALLOWED_TRANSITIONS.get(src, [])
-
-
-# ===========================================================================
 # Internal Helpers
 # ===========================================================================
 
@@ -417,6 +309,159 @@ def _apply_state(project: Any, current_raw: Any, target: ResearchState) -> None:
             project.status = target.value
     else:
         project.status = target.value
+
+
+# ===========================================================================
+# Sprint 1 Public API
+# ===========================================================================
+
+def state_progress_index(state: Any) -> int:
+    """
+    Return the zero-based position of *state* in the ordered research
+    lifecycle (``all_states_in_order``).
+
+    Sprint 1 public helper — preserved for full backward compatibility.
+    The ``StateManager.state_index()`` method delegates here.
+
+    Parameters
+    ----------
+    state : ResearchState, str, or any value coercible to ResearchState.
+
+    Returns
+    -------
+    int
+        Zero-based index in ``all_states_in_order``.
+        Returns -1 for ARCHIVED, ERROR, or any unrecognised value.
+
+    No-Invention Rule: derived solely from the statically defined
+    ``all_states_in_order`` list.
+    """
+    try:
+        coerced = _coerce_state(state)
+    except ValueError:
+        return -1
+
+    try:
+        return all_states_in_order.index(coerced)
+    except ValueError:
+        return -1
+
+
+def validate_transition(
+    from_state: Any,
+    to_state: Any,
+) -> bool:
+    """
+    Validate that a transition from *from_state* to *to_state* is
+    permitted by the state machine topology.
+
+    Sprint 1 public helper — preserved for full backward compatibility.
+
+    Parameters
+    ----------
+    from_state : ResearchState, str, or coercible value representing the
+                 current state.
+    to_state   : ResearchState, str, or coercible value representing the
+                 desired target state.
+
+    Returns
+    -------
+    bool
+        True if the transition is permitted.
+
+    Raises
+    ------
+    InvalidStateTransitionError
+        If either state cannot be coerced to a valid ResearchState, or if
+        the transition is not listed in ALLOWED_TRANSITIONS.
+
+    No-Invention Rule: validity is determined solely from
+    ALLOWED_TRANSITIONS; no external assumptions are made.
+
+    Examples
+    --------
+    >>> validate_transition(ResearchState.DRAFT, ResearchState.QUESTION_DEFINED)
+    True
+
+    >>> validate_transition(ResearchState.DRAFT, ResearchState.COMPLETE)
+    # raises InvalidStateTransitionError
+    """
+    # Coerce from_state
+    try:
+        src = _coerce_state(from_state)
+    except ValueError as exc:
+        raise InvalidStateTransitionError(
+            f"Source state is not a valid ResearchState: {from_state!r}",
+            from_state=str(from_state),
+            to_state=str(to_state),
+        ) from exc
+
+    # Coerce to_state
+    try:
+        tgt = _coerce_state(to_state)
+    except ValueError as exc:
+        raise InvalidStateTransitionError(
+            f"Target state is not a valid ResearchState: {to_state!r}",
+            from_state=src.value,
+            to_state=str(to_state),
+        ) from exc
+
+    allowed = ALLOWED_TRANSITIONS.get(src, [])
+    if tgt not in allowed:
+        raise InvalidStateTransitionError(
+            f"Transition from '{src.value}' to '{tgt.value}' is not permitted.",
+            from_state=src.value,
+            to_state=tgt.value,
+        )
+
+    return True
+
+
+# ===========================================================================
+# Sprint 2 Public Query Functions
+# ===========================================================================
+
+def get_valid_next_states(current_state: Any) -> List[ResearchState]:
+    """
+    Return the ordered list of ResearchState values that are valid
+    transition targets from *current_state*, as defined by the
+    ALLOWED_TRANSITIONS topology.
+
+    Parameters
+    ----------
+    current_state : ResearchState or coercible value.
+
+    Returns
+    -------
+    List[ResearchState]
+        Ordered list of permitted next states.  Returns an empty list for
+        terminal states (e.g. ARCHIVED) or unrecognised inputs.
+
+    No-Invention Rule: derived solely from ALLOWED_TRANSITIONS.
+    """
+    try:
+        state = _coerce_state(current_state)
+    except ValueError:
+        return []
+    return list(ALLOWED_TRANSITIONS.get(state, []))
+
+
+def is_valid_transition(from_state: Any, to_state: Any) -> bool:
+    """
+    Return True if a direct transition from *from_state* to *to_state*
+    is permitted by the ALLOWED_TRANSITIONS topology.
+
+    Unlike ``validate_transition()``, this function never raises; it
+    returns False for any invalid or unrecognisable input.
+
+    No-Invention Rule: derived solely from ALLOWED_TRANSITIONS.
+    """
+    try:
+        src = _coerce_state(from_state)
+        tgt = _coerce_state(to_state)
+    except ValueError:
+        return False
+    return tgt in ALLOWED_TRANSITIONS.get(src, [])
 
 
 # ===========================================================================
@@ -530,8 +575,8 @@ def transition_state(
         If the transition from the current state to *to_state* is not
         listed in ALLOWED_TRANSITIONS.
 
-    No-Invention Rule: transition validity is determined solely from the
-    ALLOWED_TRANSITIONS map; no external assumptions are made.
+    No-Invention Rule: transition validity is determined solely from
+    ALLOWED_TRANSITIONS; no external assumptions are made.
     """
     current_raw = getattr(project, "status", None)
 
@@ -811,8 +856,8 @@ class StateManager:
         all_states_in_order, or -1 if the state is not in the linear
         sequence (i.e. ARCHIVED or ERROR).
 
-        Delegates to the public ``state_progress_index()`` function for
-        full Sprint 1 / Sprint 2 / Sprint 3 compatibility.
+        Delegates to ``state_progress_index()`` for Sprint 1 / 2 / 3
+        compatibility.
         """
         return state_progress_index(self.current_state)
 
@@ -1073,11 +1118,12 @@ __all__ = [
     "ResearchState",
     # Canonical ordered sequence
     "all_states_in_order",
-    # Sprint 1 public helper (zero-based lifecycle index)
-    "state_progress_index",
     # Topology map
     "ALLOWED_TRANSITIONS",
-    # Public query functions
+    # Sprint 1 public helpers
+    "state_progress_index",
+    "validate_transition",
+    # Sprint 2 public query functions
     "get_valid_next_states",
     "is_valid_transition",
     # Core transition functions
