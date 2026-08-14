@@ -6,6 +6,7 @@ Sprint 2 — State Machine & Gate Validation Engine
 Provides:
 - ResearchState enumeration (all project lifecycle states)
 - all_states_in_order (canonical ordered sequence of ResearchState values)
+- get_valid_next_states() (query valid transitions from a given state)
 - StateGateError (raised when a gate check blocks a transition)
 - InvalidStateTransitionError (raised for illegal state transitions)
 - transition_state() (unconditional state transition with audit)
@@ -45,10 +46,10 @@ class StateGateError(Exception):
 
     Attributes
     ----------
-    message   : Human-readable explanation of why the gate failed.
-    reasons   : List of individual failure reasons (may be empty).
-    from_state: The state the project was in when the gate was evaluated.
-    to_state  : The target state that was blocked.
+    message    : Human-readable explanation of why the gate failed.
+    reasons    : List of individual failure reasons (may be empty).
+    from_state : The state the project was in when the gate was evaluated.
+    to_state   : The target state that was blocked.
     """
 
     def __init__(
@@ -87,9 +88,9 @@ class InvalidStateTransitionError(Exception):
 
     Attributes
     ----------
-    message   : Human-readable explanation.
-    from_state: The current (source) state.
-    to_state  : The requested (target) state.
+    message    : Human-readable explanation.
+    from_state : The current (source) state.
+    to_state   : The requested (target) state.
     """
 
     def __init__(
@@ -183,10 +184,10 @@ all_states_in_order: List[ResearchState] = [
 # State Machine Topology
 # ===========================================================================
 
-#: Maps each state to the set of states it is permitted to transition into.
-#: The ERROR state is reachable from any forward state (handled in
-#: transition_state via the UNIVERSAL_ERROR_TARGETS set).
-#: ARCHIVED is reachable from COMPLETE only.
+#: Maps each state to the ordered list of states it is permitted to
+#: transition into.  The ERROR state is reachable from every forward state
+#: (included explicitly in each list).  ARCHIVED is reachable from
+#: COMPLETE only.
 ALLOWED_TRANSITIONS: Dict[ResearchState, List[ResearchState]] = {
     ResearchState.DRAFT: [
         ResearchState.QUESTION_DEFINED,
@@ -194,22 +195,22 @@ ALLOWED_TRANSITIONS: Dict[ResearchState, List[ResearchState]] = {
     ],
     ResearchState.QUESTION_DEFINED: [
         ResearchState.FRAMEWORK_BUILT,
-        ResearchState.DRAFT,             # allow revision
+        ResearchState.DRAFT,              # allow revision
         ResearchState.ERROR,
     ],
     ResearchState.FRAMEWORK_BUILT: [
         ResearchState.DESIGN_SELECTED,
-        ResearchState.QUESTION_DEFINED,  # allow revision
+        ResearchState.QUESTION_DEFINED,   # allow revision
         ResearchState.ERROR,
     ],
     ResearchState.DESIGN_SELECTED: [
         ResearchState.LITERATURE_SEARCH,
-        ResearchState.FRAMEWORK_BUILT,   # allow revision
+        ResearchState.FRAMEWORK_BUILT,    # allow revision
         ResearchState.ERROR,
     ],
     ResearchState.LITERATURE_SEARCH: [
         ResearchState.LITERATURE_SCREENED,
-        ResearchState.DESIGN_SELECTED,   # allow revision
+        ResearchState.DESIGN_SELECTED,    # allow revision
         ResearchState.ERROR,
     ],
     ResearchState.LITERATURE_SCREENED: [
@@ -224,27 +225,69 @@ ALLOWED_TRANSITIONS: Dict[ResearchState, List[ResearchState]] = {
     ],
     ResearchState.ANALYSIS: [
         ResearchState.REPORTING,
-        ResearchState.DATA_EXTRACTION,  # allow re-extraction
+        ResearchState.DATA_EXTRACTION,    # allow re-extraction
         ResearchState.ERROR,
     ],
     ResearchState.REPORTING: [
         ResearchState.COMPLETE,
-        ResearchState.ANALYSIS,   # allow revision
+        ResearchState.ANALYSIS,           # allow revision
         ResearchState.ERROR,
     ],
     ResearchState.COMPLETE: [
         ResearchState.ARCHIVED,
-        ResearchState.REPORTING,  # allow late revision
+        ResearchState.REPORTING,          # allow late revision
         ResearchState.ERROR,
     ],
     ResearchState.ARCHIVED: [
         # Terminal — no further transitions permitted
     ],
     ResearchState.ERROR: [
-        ResearchState.DRAFT,  # allow reset to draft for recovery
+        ResearchState.DRAFT,              # allow reset to draft for recovery
         ResearchState.ERROR,
     ],
 }
+
+
+# ===========================================================================
+# Public Query: get_valid_next_states
+# ===========================================================================
+
+def get_valid_next_states(current_state: ResearchState) -> List[ResearchState]:
+    """
+    Return the ordered list of ResearchState values that are valid
+    transition targets from *current_state*, as defined by the Sprint 2
+    ALLOWED_TRANSITIONS topology.
+
+    Parameters
+    ----------
+    current_state : ResearchState
+        The state from which valid next states are queried.  Accepts any
+        value coercible to ResearchState via ``_coerce_state()``.
+
+    Returns
+    -------
+    List[ResearchState]
+        Ordered list of permitted next states.  Returns an empty list for
+        terminal states (e.g. ARCHIVED) or unrecognised inputs.
+
+    No-Invention Rule: the returned list is derived solely from the
+    statically defined ALLOWED_TRANSITIONS map; no runtime data is
+    consulted.
+
+    Examples
+    --------
+    >>> get_valid_next_states(ResearchState.DRAFT)
+    [<ResearchState.QUESTION_DEFINED: 'question_defined'>,
+     <ResearchState.ERROR: 'error'>]
+
+    >>> get_valid_next_states(ResearchState.ARCHIVED)
+    []
+    """
+    try:
+        state = _coerce_state(current_state)
+    except ValueError:
+        return []
+    return list(ALLOWED_TRANSITIONS.get(state, []))
 
 
 # ===========================================================================
@@ -283,6 +326,28 @@ def _coerce_state(value: Any) -> ResearchState:
         f"Cannot coerce {value!r} to ResearchState. "
         f"Valid values: {[s.value for s in ResearchState]}"
     )
+
+
+def _apply_state(project: Any, current_raw: Any, target: ResearchState) -> None:
+    """
+    Apply *target* state to *project*.status, preserving the original
+    attribute type where possible.
+    """
+    if not hasattr(project, "status"):
+        return
+
+    if isinstance(current_raw, ResearchState):
+        project.status = target
+    elif (
+        hasattr(current_raw, "__class__")
+        and current_raw.__class__.__name__ == "ProjectStatus"
+    ):
+        try:
+            project.status = current_raw.__class__(target.value)
+        except (ValueError, TypeError):
+            project.status = target.value
+    else:
+        project.status = target.value
 
 
 # ===========================================================================
@@ -361,28 +426,6 @@ def _write_audit(
         external_log.append(entry)
 
 
-def _apply_state(project: Any, current_raw: Any, target: ResearchState) -> None:
-    """
-    Apply *target* state to *project*.status, preserving the original
-    attribute type where possible.
-    """
-    if not hasattr(project, "status"):
-        return
-
-    if isinstance(current_raw, ResearchState):
-        project.status = target
-    elif (
-        hasattr(current_raw, "__class__")
-        and current_raw.__class__.__name__ == "ProjectStatus"
-    ):
-        try:
-            project.status = current_raw.__class__(target.value)
-        except (ValueError, TypeError):
-            project.status = target.value
-    else:
-        project.status = target.value
-
-
 # ===========================================================================
 # Core Transition Functions
 # ===========================================================================
@@ -444,7 +487,8 @@ def transition_state(
     allowed = ALLOWED_TRANSITIONS.get(current, [])
     if target not in allowed:
         raise InvalidStateTransitionError(
-            f"Transition from '{current.value}' to '{target.value}' is not permitted.",
+            f"Transition from '{current.value}' to '{target.value}' "
+            f"is not permitted.",
             from_state=current.value,
             to_state=target.value,
         )
@@ -671,7 +715,7 @@ class StateManager:
 
     def allowed_next_states(self) -> List[ResearchState]:
         """Return the list of states reachable from the current state."""
-        return list(ALLOWED_TRANSITIONS.get(self.current_state, []))
+        return get_valid_next_states(self.current_state)
 
     def can_transition_to(self, to_state: Any) -> bool:
         """
@@ -682,7 +726,7 @@ class StateManager:
             target = _coerce_state(to_state)
         except ValueError:
             return False
-        return target in ALLOWED_TRANSITIONS.get(self.current_state, [])
+        return target in get_valid_next_states(self.current_state)
 
     def is_terminal(self) -> bool:
         """Return True if the project is in a terminal state (ARCHIVED)."""
@@ -710,7 +754,8 @@ class StateManager:
             return (
                 self.state_index() != -1
                 and other_state in all_states_in_order
-                and self.state_index() < all_states_in_order.index(other_state)
+                and self.state_index()
+                < all_states_in_order.index(other_state)
             )
         except ValueError:
             return False
@@ -722,7 +767,8 @@ class StateManager:
             return (
                 self.state_index() != -1
                 and other_state in all_states_in_order
-                and self.state_index() > all_states_in_order.index(other_state)
+                and self.state_index()
+                > all_states_in_order.index(other_state)
             )
         except ValueError:
             return False
@@ -912,6 +958,73 @@ def gate_data_extracted(project: Any) -> Tuple[bool, List[str]]:
     return len(reasons) == 0, reasons
 
 
+def gate_analysis_complete(project: Any) -> Tuple[bool, List[str]]:
+    """
+    Gate: verify that analysis has been performed before advancing from
+    DATA_EXTRACTION to ANALYSIS.
+    """
+    reasons: List[str] = []
+
+    analysis = (
+        getattr(project, "analysis_results", None)
+        or getattr(project, "analysis", None)
+    )
+    if analysis is None:
+        reasons.append(
+            "Analysis must be completed before advancing to the REPORTING state."
+        )
+
+    return len(reasons) == 0, reasons
+
+
+def gate_reporting_complete(project: Any) -> Tuple[bool, List[str]]:
+    """
+    Gate: verify that a report or manuscript is present before advancing
+    from REPORTING to COMPLETE.
+    """
+    reasons: List[str] = []
+
+    report = (
+        getattr(project, "report", None)
+        or getattr(project, "manuscript", None)
+        or getattr(project, "final_report", None)
+    )
+    if report is None:
+        reasons.append(
+            "A report or manuscript must be present before marking the project COMPLETE."
+        )
+
+    return len(reasons) == 0, reasons
+
+
+# ===========================================================================
+# Convenience: is_valid_transition
+# ===========================================================================
+
+def is_valid_transition(from_state: Any, to_state: Any) -> bool:
+    """
+    Return True if a direct transition from *from_state* to *to_state*
+    is permitted by the ALLOWED_TRANSITIONS topology.
+
+    Parameters
+    ----------
+    from_state : ResearchState or coercible value.
+    to_state   : ResearchState or coercible value.
+
+    Returns
+    -------
+    bool — True if the transition is permitted, False otherwise.
+
+    No-Invention Rule: result is derived solely from ALLOWED_TRANSITIONS.
+    """
+    try:
+        src = _coerce_state(from_state)
+        tgt = _coerce_state(to_state)
+    except ValueError:
+        return False
+    return tgt in ALLOWED_TRANSITIONS.get(src, [])
+
+
 # ===========================================================================
 # Public re-exports
 # ===========================================================================
@@ -926,6 +1039,9 @@ __all__ = [
     "all_states_in_order",
     # Topology map
     "ALLOWED_TRANSITIONS",
+    # Public query functions
+    "get_valid_next_states",
+    "is_valid_transition",
     # Core transition functions
     "transition_state",
     "transition_state_gated",
@@ -940,4 +1056,6 @@ __all__ = [
     "gate_literature_searched",
     "gate_literature_screened",
     "gate_data_extracted",
+    "gate_analysis_complete",
+    "gate_reporting_complete",
 ]
