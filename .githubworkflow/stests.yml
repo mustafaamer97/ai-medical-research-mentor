@@ -27,12 +27,12 @@ jobs:
 
       - name: Run pytest
         env:
-          PYTHONPATH: ${{ github.workspace }}
+          PYTHONPATH: .
         run: |
           python -m pytest tests/ -v
 
       - name: Run smoke test
         env:
-          PYTHONPATH: ${{ github.workspace }}
+          PYTHONPATH: .
         run: |
           python smoke_test.py
