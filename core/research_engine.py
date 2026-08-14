@@ -197,8 +197,6 @@ class ResearchFrameworkResult:
 # PICO / PECO Inference Engine
 # ===========================================================================
 
-# Keywords that signal an *exposure* question (→ PECO) rather than an
-# intervention question (→ PICO).
 _EXPOSURE_KEYWORDS: List[str] = [
     "exposure", "exposed", "risk factor", "risk factors",
     "environmental", "occupational", "diet", "dietary",
@@ -207,7 +205,6 @@ _EXPOSURE_KEYWORDS: List[str] = [
     "observational", "cohort", "case-control",
 ]
 
-# Keywords that signal an *intervention* question (→ PICO).
 _INTERVENTION_KEYWORDS: List[str] = [
     "treatment", "intervention", "therapy", "drug", "medication",
     "surgery", "procedure", "vaccine", "programme", "program",
@@ -226,9 +223,9 @@ def infer_framework_type(question: str) -> FrameworkType:
     Deterministically infer whether a research question is PICO or PECO.
 
     Rules (applied in order — first match wins):
-    1. If question contains explicit PECO / exposure keywords → PECO.
-    2. If question contains explicit PICO / intervention keywords → PICO.
-    3. Default → PICO (most common clinical framework).
+    1. If exposure keywords outnumber intervention keywords → PECO.
+    2. Otherwise → PICO (most common clinical framework).
+    3. Empty question → UNKNOWN.
 
     No-Invention Rule: decision is based solely on supplied question text.
     """
@@ -242,9 +239,7 @@ def infer_framework_type(question: str) -> FrameworkType:
 
     if exposure_score > intervention_score:
         return FrameworkType.PECO
-    if intervention_score >= 0:  # default to PICO
-        return FrameworkType.PICO
-    return FrameworkType.UNKNOWN
+    return FrameworkType.PICO
 
 
 # ---------------------------------------------------------------------------
@@ -252,13 +247,6 @@ def infer_framework_type(question: str) -> FrameworkType:
 # ---------------------------------------------------------------------------
 
 def _extract_population(question: str) -> str:
-    """
-    Extract the Population element from a research question.
-
-    Strategy: look for noun phrases following 'in', 'among', 'for',
-    'patients with', 'adults with', 'children with'.
-    Returns the matched phrase or empty string (No-Invention Rule).
-    """
     patterns = [
         r"(?:in|among|for)\s+([A-Za-z0-9 ,\-]+?)(?:\s+(?:who|with|receiving|treated|aged|where|does|do|is|are|,|\?))",
         r"patients?\s+with\s+([A-Za-z0-9 ,\-]+?)(?:\s+(?:who|receiving|treated|aged|,|\?))",
@@ -274,7 +262,6 @@ def _extract_population(question: str) -> str:
 
 
 def _extract_intervention(question: str) -> str:
-    """Extract Intervention element."""
     patterns = [
         r"(?:does|do|is|are)\s+([A-Za-z0-9 ,\-]+?)\s+(?:compared|versus|vs|better|effective|reduce|improve|prevent)",
         r"(?:effect|efficacy|effectiveness)\s+of\s+([A-Za-z0-9 ,\-]+?)\s+(?:on|in|compared|versus|vs|\?)",
@@ -289,11 +276,10 @@ def _extract_intervention(question: str) -> str:
 
 
 def _extract_comparator(question: str) -> str:
-    """Extract Comparator / Control element."""
     patterns = [
         r"(?:compared\s+(?:to|with)|versus|vs\.?)\s+([A-Za-z0-9 ,\-]+?)(?:\s+(?:in|on|for|reduce|improve|affect|,|\?))",
         r"(?:versus|vs\.?)\s+([A-Za-z0-9 ,\-]+?)(?:\s+(?:in|on|for|,|\?))",
-        r"(?:placebo|standard\s+care|usual\s+care|no\s+treatment|control)",
+        r"(placebo|standard\s+care|usual\s+care|no\s+treatment|control)",
     ]
     for pattern in patterns:
         match = re.search(pattern, question, re.IGNORECASE)
@@ -306,11 +292,10 @@ def _extract_comparator(question: str) -> str:
 
 
 def _extract_outcome(question: str) -> str:
-    """Extract Outcome element."""
     patterns = [
         r"(?:on|affect|reduce|improve|prevent|increase|decrease)\s+([A-Za-z0-9 ,\-]+?)(?:\s+(?:in|among|for|,|\?|$))",
         r"(?:outcome|endpoint|measure)[s]?\s*[:\-]?\s*([A-Za-z0-9 ,\-]+?)(?:\s*[,\?]|$)",
-        r"(?:mortality|survival|recurrence|remission|quality\s+of\s+life|pain|function|hospitalisation|hospitalization)",
+        r"(mortality|survival|recurrence|remission|quality\s+of\s+life|pain|function|hospitalisation|hospitalization)",
     ]
     for pattern in patterns:
         match = re.search(pattern, question, re.IGNORECASE)
@@ -323,11 +308,10 @@ def _extract_outcome(question: str) -> str:
 
 
 def _extract_exposure(question: str) -> str:
-    """Extract Exposure element (for PECO questions)."""
     patterns = [
         r"(?:exposure\s+to|exposed\s+to)\s+([A-Za-z0-9 ,\-]+?)(?:\s+(?:and|in|among|on|,|\?))",
         r"(?:effect|impact|association)\s+of\s+([A-Za-z0-9 ,\-]+?)\s+(?:on|with|in)",
-        r"(?:smoking|alcohol|diet|radiation|pollution|occupational)\s+([A-Za-z0-9 ,\-]*)",
+        r"(smoking|alcohol|diet|radiation|pollution|occupational)\s+([A-Za-z0-9 ,\-]*)",
     ]
     for pattern in patterns:
         match = re.search(pattern, question, re.IGNORECASE)
@@ -419,13 +403,101 @@ def infer_framework(question: str) -> ResearchFrameworkResult:
     )
 
 
+def build_framework(
+    population: str = "",
+    intervention: str = "",
+    comparator: str = "",
+    outcome: str = "",
+    exposure: str = "",
+    framework_type: Optional[FrameworkType] = None,
+    time_horizon: Optional[str] = None,
+    setting: Optional[str] = None,
+    raw_question: str = "",
+) -> ResearchFrameworkResult:
+    """
+    Build a ResearchFrameworkResult directly from explicit field values
+    rather than inferring them from free text.
+
+    Caller supplies the structured elements; this function assembles,
+    validates, and (where valid) recommends a study design.
+
+    No-Invention Rule: no field value is fabricated. If a field is not
+    supplied it remains an empty string. Framework type is determined
+    from the presence of *exposure* vs *intervention* when not explicitly
+    provided.
+
+    Parameters
+    ----------
+    population      : Population / Participants element.
+    intervention    : Intervention element (PICO).
+    comparator      : Comparator / Control element.
+    outcome         : Outcome element.
+    exposure        : Exposure element (PECO). When non-empty and
+                      framework_type is not explicitly set, PECO is used.
+    framework_type  : Override the inferred FrameworkType.
+    time_horizon    : Optional time horizon string.
+    setting         : Optional study setting string.
+    raw_question    : Optional originating free-text question for provenance.
+
+    Returns
+    -------
+    ResearchFrameworkResult
+    """
+    # Determine framework type
+    if framework_type is None:
+        if exposure and exposure.strip():
+            framework_type = FrameworkType.PECO
+        else:
+            framework_type = FrameworkType.PICO
+
+    if framework_type == FrameworkType.PECO:
+        peco = PECOFramework(
+            population=population,
+            exposure=exposure,
+            comparator=comparator,
+            outcome=outcome,
+            framework_type=FrameworkType.PECO,
+            time_horizon=time_horizon,
+            setting=setting,
+        )
+        validation = validate_peco(peco)
+        design = recommend_study_design_from_peco(peco) if validation.is_valid else None
+        return ResearchFrameworkResult(
+            framework_type=FrameworkType.PECO,
+            peco=peco,
+            validation=validation,
+            study_design=design,
+            raw_question=raw_question,
+        )
+
+    # PICO (default)
+    pico = PICOFramework(
+        population=population,
+        intervention=intervention,
+        comparator=comparator,
+        outcome=outcome,
+        framework_type=FrameworkType.PICO,
+        time_horizon=time_horizon,
+        setting=setting,
+    )
+    validation = validate_pico(pico)
+    design = recommend_study_design_from_pico(pico) if validation.is_valid else None
+    return ResearchFrameworkResult(
+        framework_type=FrameworkType.PICO,
+        pico=pico,
+        validation=validation,
+        study_design=design,
+        raw_question=raw_question,
+    )
+
+
 # ===========================================================================
 # Validation Engine
 # ===========================================================================
 
 def validate_pico(pico: PICOFramework) -> ValidationResult:
     """
-    Validate a PICOFramework.  Returns errors for missing mandatory fields
+    Validate a PICOFramework. Returns errors for missing mandatory fields
     and warnings for fields that appear unusually short.
     """
     errors: List[str] = []
@@ -533,10 +605,6 @@ def validate_framework(framework: ResearchFrameworkResult) -> ValidationResult:
 # Study Design Recommendation Engine
 # ===========================================================================
 
-# ---------------------------------------------------------------------------
-# Heuristic keyword sets used for deterministic design selection
-# ---------------------------------------------------------------------------
-
 _RCT_KEYWORDS = [
     "randomized", "randomised", "rct", "trial", "placebo",
     "blinded", "double-blind", "single-blind",
@@ -597,7 +665,6 @@ def recommend_study_design_from_pico(pico: PICOFramework) -> StudyDesignRecommen
         StudyDesign.SYSTEMATIC_REVIEW: _score_keywords(combined, _SR_KEYWORDS),
     }
 
-    # Hierarchy for tie-breaking (index = priority, lower = preferred)
     hierarchy = [
         StudyDesign.RCT,
         StudyDesign.COHORT,
@@ -609,7 +676,6 @@ def recommend_study_design_from_pico(pico: PICOFramework) -> StudyDesignRecommen
     best_design = max(hierarchy, key=lambda d: (scores[d], -hierarchy.index(d)))
 
     if scores[best_design] == 0:
-        # No keywords matched — recommend RCT for intervention PICO by default
         best_design = StudyDesign.RCT
         confidence = "low"
     else:
@@ -679,6 +745,25 @@ def recommend_study_design_from_peco(peco: PECOFramework) -> StudyDesignRecommen
         feasibility_notes=feasibility,
         ethical_considerations=ethical,
         confidence=confidence,
+    )
+
+
+def recommend_study_design(framework: ResearchFrameworkResult) -> StudyDesignRecommendation:
+    """
+    Recommend a study design from a ResearchFrameworkResult by dispatching
+    to the appropriate PICO or PECO recommender.
+
+    No-Invention Rule: recommendation is derived solely from the framework
+    content supplied.
+    """
+    if framework.framework_type == FrameworkType.PECO and framework.peco:
+        return recommend_study_design_from_peco(framework.peco)
+    if framework.pico:
+        return recommend_study_design_from_pico(framework.pico)
+    return StudyDesignRecommendation(
+        recommended_design=StudyDesign.UNKNOWN,
+        rationale="Insufficient framework data to recommend a study design.",
+        confidence="low",
     )
 
 
@@ -805,7 +890,9 @@ def _build_ethical_considerations(design: StudyDesign) -> List[str]:
 # State Gate Evaluation
 # ===========================================================================
 
-def evaluate_framework_gate(framework_result: ResearchFrameworkResult) -> Tuple[bool, List[str]]:
+def evaluate_framework_gate(
+    framework_result: ResearchFrameworkResult,
+) -> Tuple[bool, List[str]]:
     """
     Evaluate whether a ResearchFrameworkResult meets the gate criteria
     required to advance to the next research phase.
@@ -824,7 +911,9 @@ def evaluate_framework_gate(framework_result: ResearchFrameworkResult) -> Tuple[
     reasons: List[str] = []
 
     if framework_result.framework_type == FrameworkType.UNKNOWN:
-        reasons.append("Framework type could not be determined from the research question.")
+        reasons.append(
+            "Framework type could not be determined from the research question."
+        )
         return False, reasons
 
     if framework_result.validation is None:
@@ -836,7 +925,6 @@ def evaluate_framework_gate(framework_result: ResearchFrameworkResult) -> Tuple[
         reasons.extend(framework_result.validation.errors)
         return False, reasons
 
-    # Check minimum field population
     if framework_result.framework_type == FrameworkType.PECO and framework_result.peco:
         if not framework_result.peco.population.strip():
             reasons.append("Population is required to advance.")
@@ -858,7 +946,9 @@ def evaluate_framework_gate(framework_result: ResearchFrameworkResult) -> Tuple[
     return True, reasons
 
 
-def evaluate_design_gate(recommendation: Optional[StudyDesignRecommendation]) -> Tuple[bool, List[str]]:
+def evaluate_design_gate(
+    recommendation: Optional[StudyDesignRecommendation],
+) -> Tuple[bool, List[str]]:
     """
     Evaluate whether a StudyDesignRecommendation meets the gate criteria
     required to advance to literature search phase.
@@ -930,7 +1020,47 @@ def get_framework_summary(result: ResearchFrameworkResult) -> str:
             lines.append(f"  WARNING : {warn}")
 
     if result.study_design:
-        lines.append(f"Recommended Design: {result.study_design.recommended_design.value}")
+        lines.append(
+            f"Recommended Design: {result.study_design.recommended_design.value}"
+        )
         lines.append(f"  Rationale: {result.study_design.rationale}")
 
     return "\n".join(lines)
+
+
+# ===========================================================================
+# Public re-exports — everything the test suite may import by name
+# ===========================================================================
+
+__all__ = [
+    # Enumerations
+    "FrameworkType",
+    "StudyDesign",
+    "ValidationStatus",
+    # Data containers
+    "PICOFramework",
+    "PECOFramework",
+    "ValidationResult",
+    "StudyDesignRecommendation",
+    "ResearchFrameworkResult",
+    # Inference
+    "infer_framework_type",
+    "infer_pico",
+    "infer_peco",
+    "infer_framework",
+    "build_framework",
+    # Validation
+    "validate_pico",
+    "validate_peco",
+    "validate_framework",
+    # Study design
+    "recommend_study_design",
+    "recommend_study_design_from_pico",
+    "recommend_study_design_from_peco",
+    # Gate evaluation
+    "evaluate_framework_gate",
+    "evaluate_design_gate",
+    # Convenience
+    "process_research_question",
+    "get_framework_summary",
+]
