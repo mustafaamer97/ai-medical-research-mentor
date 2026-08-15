@@ -1,60 +1,60 @@
 """
 core/state.py
 =============
-Sprint 1 / Sprint 2 / Sprint 3 — State Machine & Gate Validation Engine
-
-Provides:
-- ResearchState enumeration (all project lifecycle states)
-- all_states_in_order (canonical ordered sequence of ResearchState values)
-- state_progress_index() (Sprint 1: zero-based position in lifecycle)
-- validate_transition() (Sprint 1: validate a transition, raise on failure)
-- get_valid_next_states() (Sprint 2: query valid transitions from a state)
-- is_valid_transition() (topology boolean query)
-- StateGateError (raised when a gate check blocks a transition)
-- InvalidStateTransitionError (raised for illegal state transitions)
-- transition_state() (unconditional state transition with audit)
-- transition_state_gated() (gate-checked state transition)
-- StateManager (project-level state coordinator)
-- Standalone gate helpers
-
-No-Invention Rule: All state transitions and gate evaluations are
-determined solely from the data present in the supplied project /
-framework objects. Nothing is assumed or fabricated.
+Unified Research Lifecycle State Machine
+----------------------------------------
+Single source of truth:
+    core.models.ResearchProject.state
+    core.models.ResearchStateEnum
+This module provides:
+- ResearchState compatibility alias
+- Canonical research lifecycle
+- Explicit transition topology
+- State validation
+- State progress helpers
+- Gate validation
+- Audited transitions
+- StateManager coordinator
+- Sprint 1 / 2 / 3 compatible public helpers
+IMPORTANT
+---------
+The state machine never invents research information.
+Gate decisions are based only on fields actually present on the supplied
+ResearchProject and its nested models.
+The canonical state enum is ResearchStateEnum from core.models.
 """
-
 from __future__ import annotations
-
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
-
-# ---------------------------------------------------------------------------
-# Internal imports — tolerant of partial model availability
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Imports
+# ============================================================================
 try:
-    from core.models import ResearchProject, ProjectStatus
+    from core.models import (
+        ResearchProject,
+        ResearchStateEnum,
+        ResearchFramework,
+        LiteratureSearchStrategy,
+        ScreeningDecisionEnum,
+    )
 except ImportError:  # pragma: no cover
-    ResearchProject = None   # type: ignore[assignment,misc]
-    ProjectStatus = None     # type: ignore[assignment,misc]
-
-
-# ===========================================================================
-# Custom Exceptions
-# ===========================================================================
-
+    ResearchProject = None  # type: ignore
+    ResearchStateEnum = None  # type: ignore
+    ResearchFramework = None  # type: ignore
+    LiteratureSearchStrategy = None  # type: ignore
+    ScreeningDecisionEnum = None  # type: ignore
+# ============================================================================
+# Compatibility
+# ============================================================================
+# The previous implementation exposed ResearchState.
+# Keep that public name so existing imports do not immediately break.
+ResearchState = ResearchStateEnum
+# ============================================================================
+# Exceptions
+# ============================================================================
 class StateGateError(Exception):
-    """
-    Raised when a state gate check prevents a project from advancing to
-    the next lifecycle phase.
-
-    Attributes
-    ----------
-    message    : Human-readable explanation of why the gate failed.
-    reasons    : List of individual failure reasons (may be empty).
-    from_state : The state the project was in when the gate was evaluated.
-    to_state   : The target state that was blocked.
-    """
-
+    """Raised when a state gate prevents a transition."""
     def __init__(
         self,
         message: str,
@@ -64,16 +64,13 @@ class StateGateError(Exception):
     ) -> None:
         super().__init__(message)
         self.message = message
-        self.reasons: List[str] = reasons or []
+        self.reasons = reasons or []
         self.from_state = from_state
         self.to_state = to_state
-
     def __str__(self) -> str:
-        base = self.message
         if self.reasons:
-            base += " | Reasons: " + "; ".join(self.reasons)
-        return base
-
+            return f"{self.message} | Reasons: {'; '.join(self.reasons)}"
+        return self.message
     def to_dict(self) -> Dict[str, Any]:
         return {
             "error": "StateGateError",
@@ -82,20 +79,8 @@ class StateGateError(Exception):
             "from_state": self.from_state,
             "to_state": self.to_state,
         }
-
-
 class InvalidStateTransitionError(Exception):
-    """
-    Raised when a requested state transition is not permitted by the
-    defined state machine topology.
-
-    Attributes
-    ----------
-    message    : Human-readable explanation.
-    from_state : The current (source) state.
-    to_state   : The requested (target) state.
-    """
-
+    """Raised when a transition is not allowed by the state topology."""
     def __init__(
         self,
         message: str,
@@ -106,13 +91,11 @@ class InvalidStateTransitionError(Exception):
         self.message = message
         self.from_state = from_state
         self.to_state = to_state
-
     def __str__(self) -> str:
         return (
             f"{self.message} "
             f"(from={self.from_state!r} -> to={self.to_state!r})"
         )
-
     def to_dict(self) -> Dict[str, Any]:
         return {
             "error": "InvalidStateTransitionError",
@@ -120,364 +103,242 @@ class InvalidStateTransitionError(Exception):
             "from_state": self.from_state,
             "to_state": self.to_state,
         }
-
-
-# ===========================================================================
-# ResearchState Enumeration
-# ===========================================================================
-
-class ResearchState(str, Enum):
-    """
-    Ordered lifecycle states for a research project.
-
-    The canonical forward progression is:
-
-        DRAFT
-          -> QUESTION_DEFINED
-          -> FRAMEWORK_BUILT
-          -> DESIGN_SELECTED
-          -> LITERATURE_SEARCH
-          -> LITERATURE_SCREENED
-          -> DATA_EXTRACTION
-          -> ANALYSIS
-          -> REPORTING
-          -> COMPLETE
-
-    Backward transitions and lateral moves are explicitly prohibited
-    except where noted in ALLOWED_TRANSITIONS.
-    ARCHIVED and ERROR are special terminal / recovery states.
-    """
-
-    DRAFT = "draft"
-    QUESTION_DEFINED = "question_defined"
-    FRAMEWORK_BUILT = "framework_built"
-    DESIGN_SELECTED = "design_selected"
-    LITERATURE_SEARCH = "literature_search"
-    LITERATURE_SCREENED = "literature_screened"
-    DATA_EXTRACTION = "data_extraction"
-    ANALYSIS = "analysis"
-    REPORTING = "reporting"
-    COMPLETE = "complete"
-    ARCHIVED = "archived"
-    ERROR = "error"
-
-
-# ===========================================================================
-# Canonical Ordered Sequence
-# ===========================================================================
-
-#: The ordered list of ResearchState values representing the canonical
-#: forward research lifecycle, excluding the special ARCHIVED and ERROR
-#: states which are not part of the linear progression.
-all_states_in_order: List[ResearchState] = [
-    ResearchState.DRAFT,
-    ResearchState.QUESTION_DEFINED,
-    ResearchState.FRAMEWORK_BUILT,
-    ResearchState.DESIGN_SELECTED,
-    ResearchState.LITERATURE_SEARCH,
-    ResearchState.LITERATURE_SCREENED,
-    ResearchState.DATA_EXTRACTION,
-    ResearchState.ANALYSIS,
-    ResearchState.REPORTING,
-    ResearchState.COMPLETE,
+# ============================================================================
+# Canonical lifecycle
+# ============================================================================
+all_states_in_order: List[ResearchStateEnum] = [
+    ResearchStateEnum.IDEA,
+    ResearchStateEnum.QUESTION_DEFINED,
+    ResearchStateEnum.DESIGN_SELECTED,
+    ResearchStateEnum.PROTOCOL_READY,
+    ResearchStateEnum.LITERATURE_SEARCH,
+    ResearchStateEnum.SCREENING,
+    ResearchStateEnum.DATA_COLLECTION,
+    ResearchStateEnum.DATA_READY,
+    ResearchStateEnum.ANALYSIS_PLAN_LOCKED,
+    ResearchStateEnum.ANALYSIS_COMPLETE,
+    ResearchStateEnum.MANUSCRIPT_DRAFT,
+    ResearchStateEnum.AUDIT,
+    ResearchStateEnum.JOURNAL_SELECTION,
+    ResearchStateEnum.READY_FOR_SUBMISSION,
 ]
-
-
-# ===========================================================================
-# State Machine Topology
-# ===========================================================================
-
-#: Maps each state to the ordered list of states it is permitted to
-#: transition into.  The ERROR state is reachable from every forward state
-#: (included explicitly in each list).  ARCHIVED is reachable from
-#: COMPLETE only.
-ALLOWED_TRANSITIONS: Dict[ResearchState, List[ResearchState]] = {
-    ResearchState.DRAFT: [
-        ResearchState.QUESTION_DEFINED,
-        ResearchState.ERROR,
+# ============================================================================
+# State topology
+# ============================================================================
+ALLOWED_TRANSITIONS: Dict[
+    ResearchStateEnum,
+    List[ResearchStateEnum],
+] = {
+    ResearchStateEnum.IDEA: [
+        ResearchStateEnum.QUESTION_DEFINED,
     ],
-    ResearchState.QUESTION_DEFINED: [
-        ResearchState.FRAMEWORK_BUILT,
-        ResearchState.DRAFT,              # allow revision
-        ResearchState.ERROR,
+    ResearchStateEnum.QUESTION_DEFINED: [
+        ResearchStateEnum.DESIGN_SELECTED,
+        ResearchStateEnum.IDEA,
     ],
-    ResearchState.FRAMEWORK_BUILT: [
-        ResearchState.DESIGN_SELECTED,
-        ResearchState.QUESTION_DEFINED,   # allow revision
-        ResearchState.ERROR,
+    ResearchStateEnum.DESIGN_SELECTED: [
+        ResearchStateEnum.PROTOCOL_READY,
+        ResearchStateEnum.QUESTION_DEFINED,
     ],
-    ResearchState.DESIGN_SELECTED: [
-        ResearchState.LITERATURE_SEARCH,
-        ResearchState.FRAMEWORK_BUILT,    # allow revision
-        ResearchState.ERROR,
+    ResearchStateEnum.PROTOCOL_READY: [
+        ResearchStateEnum.LITERATURE_SEARCH,
+        ResearchStateEnum.DESIGN_SELECTED,
     ],
-    ResearchState.LITERATURE_SEARCH: [
-        ResearchState.LITERATURE_SCREENED,
-        ResearchState.DESIGN_SELECTED,    # allow revision
-        ResearchState.ERROR,
+    ResearchStateEnum.LITERATURE_SEARCH: [
+        ResearchStateEnum.SCREENING,
+        ResearchStateEnum.PROTOCOL_READY,
     ],
-    ResearchState.LITERATURE_SCREENED: [
-        ResearchState.DATA_EXTRACTION,
-        ResearchState.LITERATURE_SEARCH,  # allow re-search
-        ResearchState.ERROR,
+    ResearchStateEnum.SCREENING: [
+        ResearchStateEnum.DATA_COLLECTION,
+        ResearchStateEnum.LITERATURE_SEARCH,
     ],
-    ResearchState.DATA_EXTRACTION: [
-        ResearchState.ANALYSIS,
-        ResearchState.LITERATURE_SCREENED,  # allow re-screening
-        ResearchState.ERROR,
+    ResearchStateEnum.DATA_COLLECTION: [
+        ResearchStateEnum.DATA_READY,
+        ResearchStateEnum.SCREENING,
     ],
-    ResearchState.ANALYSIS: [
-        ResearchState.REPORTING,
-        ResearchState.DATA_EXTRACTION,    # allow re-extraction
-        ResearchState.ERROR,
+    ResearchStateEnum.DATA_READY: [
+        ResearchStateEnum.ANALYSIS_PLAN_LOCKED,
+        ResearchStateEnum.DATA_COLLECTION,
     ],
-    ResearchState.REPORTING: [
-        ResearchState.COMPLETE,
-        ResearchState.ANALYSIS,           # allow revision
-        ResearchState.ERROR,
+    ResearchStateEnum.ANALYSIS_PLAN_LOCKED: [
+        ResearchStateEnum.ANALYSIS_COMPLETE,
+        ResearchStateEnum.DATA_READY,
     ],
-    ResearchState.COMPLETE: [
-        ResearchState.ARCHIVED,
-        ResearchState.REPORTING,          # allow late revision
-        ResearchState.ERROR,
+    ResearchStateEnum.ANALYSIS_COMPLETE: [
+        ResearchStateEnum.MANUSCRIPT_DRAFT,
+        ResearchStateEnum.ANALYSIS_PLAN_LOCKED,
     ],
-    ResearchState.ARCHIVED: [
-        # Terminal — no further transitions permitted
+    ResearchStateEnum.MANUSCRIPT_DRAFT: [
+        ResearchStateEnum.AUDIT,
+        ResearchStateEnum.ANALYSIS_COMPLETE,
     ],
-    ResearchState.ERROR: [
-        ResearchState.DRAFT,              # allow reset to draft for recovery
-        ResearchState.ERROR,
+    ResearchStateEnum.AUDIT: [
+        ResearchStateEnum.JOURNAL_SELECTION,
+        ResearchStateEnum.MANUSCRIPT_DRAFT,
+    ],
+    ResearchStateEnum.JOURNAL_SELECTION: [
+        ResearchStateEnum.READY_FOR_SUBMISSION,
+        ResearchStateEnum.AUDIT,
+    ],
+    ResearchStateEnum.READY_FOR_SUBMISSION: [
+        ResearchStateEnum.JOURNAL_SELECTION,
     ],
 }
-
-
-# ===========================================================================
-# Internal Helpers
-# ===========================================================================
-
+# ============================================================================
+# Internal helpers
+# ============================================================================
 def _now_iso() -> str:
+    """Return the current UTC timestamp as ISO-8601."""
     return datetime.now(timezone.utc).isoformat()
-
-
-def _coerce_state(value: Any) -> ResearchState:
+def _coerce_state(value: Any) -> ResearchStateEnum:
     """
-    Coerce a string, ProjectStatus, or ResearchState value into a
-    ResearchState.  Raises ValueError if not recognisable.
+    Convert supported state representations into ResearchStateEnum.
+    Accepted:
+        - ResearchStateEnum
+        - ResearchState alias
+        - enum-like objects with .value
+        - state values such as "IDEA"
+        - state values such as "idea"
     """
-    if isinstance(value, ResearchState):
+    if isinstance(value, ResearchStateEnum):
         return value
-
-    # Accept objects with a .value attribute (e.g. ProjectStatus)
     if value is not None and hasattr(value, "value"):
         value = value.value
-
     if isinstance(value, str):
-        # Match by value (e.g. "draft")
+        raw = value.strip()
+        # Exact enum value.
+        for state in ResearchStateEnum:
+            if raw == state.value:
+                return state
+        # Case-insensitive enum value.
+        for state in ResearchStateEnum:
+            if raw.lower() == state.value.lower():
+                return state
+        # Enum member name.
         try:
-            return ResearchState(value.lower())
-        except ValueError:
-            pass
-        # Match by name (e.g. "DRAFT")
-        try:
-            return ResearchState[value.upper()]
+            return ResearchStateEnum[raw.upper()]
         except KeyError:
             pass
-
     raise ValueError(
-        f"Cannot coerce {value!r} to ResearchState. "
-        f"Valid values: {[s.value for s in ResearchState]}"
+        f"Cannot coerce {value!r} to ResearchStateEnum. "
+        f"Valid values: {[state.value for state in ResearchStateEnum]}"
     )
-
-
-def _apply_state(project: Any, current_raw: Any, target: ResearchState) -> None:
-    """
-    Apply *target* state to *project*.status, preserving the original
-    attribute type where possible.
-    """
-    if not hasattr(project, "status"):
-        return
-
-    if isinstance(current_raw, ResearchState):
-        project.status = target
-    elif (
-        hasattr(current_raw, "__class__")
-        and current_raw.__class__.__name__ == "ProjectStatus"
-    ):
-        try:
-            project.status = current_raw.__class__(target.value)
-        except (ValueError, TypeError):
-            project.status = target.value
-    else:
-        project.status = target.value
-
-
-# ===========================================================================
-# Sprint 1 Public API
-# ===========================================================================
-
+def _get_project_state(project: Any) -> ResearchStateEnum:
+    """Read the canonical state from project.state."""
+    if not hasattr(project, "state"):
+        raise InvalidStateTransitionError(
+            "Project does not expose the canonical 'state' attribute."
+        )
+    try:
+        return _coerce_state(project.state)
+    except ValueError as exc:
+        raise InvalidStateTransitionError(
+            f"Project has an invalid state: {project.state!r}",
+            from_state=str(project.state),
+        ) from exc
+def _apply_state(
+    project: Any,
+    target: ResearchStateEnum,
+) -> None:
+    """Apply the canonical state to project.state."""
+    if not hasattr(project, "state"):
+        raise InvalidStateTransitionError(
+            "Project does not expose the canonical 'state' attribute."
+        )
+    project.state = target
+    # ResearchProject exposes touch(), so keep updated_at synchronized.
+    touch = getattr(project, "touch", None)
+    if callable(touch):
+        touch()
+def _clean_text(value: Any) -> str:
+    """Return a safely normalized non-empty string."""
+    if value is None:
+        return ""
+    return str(value).strip()
+def _has_non_empty_text(value: Any) -> bool:
+    return bool(_clean_text(value))
+# ============================================================================
+# Progress helpers
+# ============================================================================
 def state_progress_index(state: Any) -> int:
     """
-    Return the zero-based position of *state* in the ordered research
-    lifecycle (``all_states_in_order``).
-
-    Sprint 1 public helper — preserved for full backward compatibility.
-    The ``StateManager.state_index()`` method delegates here.
-
-    Parameters
-    ----------
-    state : ResearchState, str, or any value coercible to ResearchState.
-
-    Returns
-    -------
-    int
-        Zero-based index in ``all_states_in_order``.
-        Returns -1 for ARCHIVED, ERROR, or any unrecognised value.
-
-    No-Invention Rule: derived solely from the statically defined
-    ``all_states_in_order`` list.
+    Return the zero-based position in the canonical lifecycle.
+    Returns -1 for invalid/special values.
     """
     try:
         coerced = _coerce_state(state)
     except ValueError:
         return -1
-
     try:
         return all_states_in_order.index(coerced)
     except ValueError:
         return -1
-
-
+# ============================================================================
+# Transition validation
+# ============================================================================
 def validate_transition(
     from_state: Any,
     to_state: Any,
 ) -> bool:
     """
-    Validate that a transition from *from_state* to *to_state* is
-    permitted by the state machine topology.
-
-    Sprint 1 public helper — preserved for full backward compatibility.
-
-    Parameters
-    ----------
-    from_state : ResearchState, str, or coercible value representing the
-                 current state.
-    to_state   : ResearchState, str, or coercible value representing the
-                 desired target state.
-
-    Returns
-    -------
-    bool
-        True if the transition is permitted.
-
-    Raises
-    ------
-    InvalidStateTransitionError
-        If either state cannot be coerced to a valid ResearchState, or if
-        the transition is not listed in ALLOWED_TRANSITIONS.
-
-    No-Invention Rule: validity is determined solely from
-    ALLOWED_TRANSITIONS; no external assumptions are made.
-
-    Examples
-    --------
-    >>> validate_transition(ResearchState.DRAFT, ResearchState.QUESTION_DEFINED)
-    True
-
-    >>> validate_transition(ResearchState.DRAFT, ResearchState.COMPLETE)
-    # raises InvalidStateTransitionError
+    Validate a direct state transition.
+    Raises InvalidStateTransitionError when invalid.
     """
-    # Coerce from_state
     try:
-        src = _coerce_state(from_state)
+        source = _coerce_state(from_state)
     except ValueError as exc:
         raise InvalidStateTransitionError(
-            f"Source state is not a valid ResearchState: {from_state!r}",
+            f"Invalid source state: {from_state!r}",
             from_state=str(from_state),
             to_state=str(to_state),
         ) from exc
-
-    # Coerce to_state
     try:
-        tgt = _coerce_state(to_state)
+        target = _coerce_state(to_state)
     except ValueError as exc:
         raise InvalidStateTransitionError(
-            f"Target state is not a valid ResearchState: {to_state!r}",
-            from_state=src.value,
+            f"Invalid target state: {to_state!r}",
+            from_state=source.value,
             to_state=str(to_state),
         ) from exc
-
-    allowed = ALLOWED_TRANSITIONS.get(src, [])
-    if tgt not in allowed:
+    if target not in ALLOWED_TRANSITIONS.get(source, []):
         raise InvalidStateTransitionError(
-            f"Transition from '{src.value}' to '{tgt.value}' is not permitted.",
-            from_state=src.value,
-            to_state=tgt.value,
+            (
+                f"Transition from '{source.value}' "
+                f"to '{target.value}' is not permitted."
+            ),
+            from_state=source.value,
+            to_state=target.value,
         )
-
     return True
-
-
-# ===========================================================================
-# Sprint 2 Public Query Functions
-# ===========================================================================
-
-def get_valid_next_states(current_state: Any) -> List[ResearchState]:
-    """
-    Return the ordered list of ResearchState values that are valid
-    transition targets from *current_state*, as defined by the
-    ALLOWED_TRANSITIONS topology.
-
-    Parameters
-    ----------
-    current_state : ResearchState or coercible value.
-
-    Returns
-    -------
-    List[ResearchState]
-        Ordered list of permitted next states.  Returns an empty list for
-        terminal states (e.g. ARCHIVED) or unrecognised inputs.
-
-    No-Invention Rule: derived solely from ALLOWED_TRANSITIONS.
-    """
+def get_valid_next_states(
+    current_state: Any,
+) -> List[ResearchStateEnum]:
+    """Return all topologically valid next states."""
     try:
         state = _coerce_state(current_state)
     except ValueError:
         return []
     return list(ALLOWED_TRANSITIONS.get(state, []))
-
-
-def is_valid_transition(from_state: Any, to_state: Any) -> bool:
-    """
-    Return True if a direct transition from *from_state* to *to_state*
-    is permitted by the ALLOWED_TRANSITIONS topology.
-
-    Unlike ``validate_transition()``, this function never raises; it
-    returns False for any invalid or unrecognisable input.
-
-    No-Invention Rule: derived solely from ALLOWED_TRANSITIONS.
-    """
+def is_valid_transition(
+    from_state: Any,
+    to_state: Any,
+) -> bool:
+    """Boolean-only transition query. Never raises."""
     try:
-        src = _coerce_state(from_state)
-        tgt = _coerce_state(to_state)
+        source = _coerce_state(from_state)
+        target = _coerce_state(to_state)
     except ValueError:
         return False
-    return tgt in ALLOWED_TRANSITIONS.get(src, [])
-
-
-# ===========================================================================
-# Transition Audit Record
-# ===========================================================================
-
+    return target in ALLOWED_TRANSITIONS.get(source, [])
+# ============================================================================
+# Audit
+# ============================================================================
 class TransitionRecord:
-    """
-    Immutable record of a state transition event, written to the project
-    audit trail.
-    """
-
+    """Serializable state transition audit record."""
     def __init__(
         self,
-        from_state: ResearchState,
-        to_state: ResearchState,
+        from_state: ResearchStateEnum,
+        to_state: ResearchStateEnum,
         triggered_by: str = "system",
         note: str = "",
         gated: bool = False,
@@ -490,9 +351,8 @@ class TransitionRecord:
         self.note = note
         self.gated = gated
         self.gate_passed = gate_passed
-        self.gate_reasons: List[str] = gate_reasons or []
+        self.gate_reasons = gate_reasons or []
         self.timestamp = _now_iso()
-
     def to_dict(self) -> Dict[str, Any]:
         return {
             "event": "state_transition",
@@ -502,48 +362,30 @@ class TransitionRecord:
             "note": self.note,
             "gated": self.gated,
             "gate_passed": self.gate_passed,
-            "gate_reasons": self.gate_reasons,
+            "gate_reasons": list(self.gate_reasons),
             "timestamp": self.timestamp,
         }
-
-
-# ===========================================================================
-# Audit Trail Helper
-# ===========================================================================
-
 def _write_audit(
     project: Any,
     record: TransitionRecord,
-    external_log: Optional[List[Dict[str, Any]]],
+    external_log: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     """
-    Write a TransitionRecord to the project's audit trail and / or an
-    external log list.
-
-    Supports projects that expose any of:
-    - audit_log   : List[Dict]
-    - audit_trail : List[Dict]
-    - history     : List[Dict]
-
-    If none of these attributes exist the record is silently discarded
-    unless an external_log is provided.
+    Write audit entry to an existing project audit collection if available.
+    If the project does not expose one, only external_log is used.
     """
     entry = record.to_dict()
-
+    # Preserve compatibility with future/older project models.
     for attr in ("audit_log", "audit_trail", "history"):
         trail = getattr(project, attr, None)
         if isinstance(trail, list):
             trail.append(entry)
             break
-
     if external_log is not None:
         external_log.append(entry)
-
-
-# ===========================================================================
-# Core Transition Functions
-# ===========================================================================
-
+# ============================================================================
+# Core transitions
+# ============================================================================
 def transition_state(
     project: Any,
     to_state: Any,
@@ -553,60 +395,19 @@ def transition_state(
     _audit_log: Optional[List[Dict[str, Any]]] = None,
 ) -> Any:
     """
-    Unconditionally transition a project to *to_state* if the move is
-    permitted by the state machine topology.
-
-    Parameters
-    ----------
-    project      : Object with a `status` attribute representing the current
-                   state.  The attribute is updated in-place.
-    to_state     : Target ResearchState (or coercible value).
-    triggered_by : Identifier of the actor requesting the transition.
-    note         : Optional human-readable annotation for the audit trail.
-    _audit_log   : Optional list to append the TransitionRecord dict to.
-
-    Returns
-    -------
-    The mutated project object.
-
-    Raises
-    ------
-    InvalidStateTransitionError
-        If the transition from the current state to *to_state* is not
-        listed in ALLOWED_TRANSITIONS.
-
-    No-Invention Rule: transition validity is determined solely from
-    ALLOWED_TRANSITIONS; no external assumptions are made.
+    Perform an unconditional topology-validated transition.
+    This function does NOT perform research gates.
     """
-    current_raw = getattr(project, "status", None)
-
-    try:
-        current = _coerce_state(current_raw)
-    except ValueError as exc:
-        raise InvalidStateTransitionError(
-            f"Project has unrecognisable current state: {current_raw!r}",
-            from_state=str(current_raw),
-            to_state=str(to_state),
-        ) from exc
-
+    current = _get_project_state(project)
     try:
         target = _coerce_state(to_state)
     except ValueError as exc:
         raise InvalidStateTransitionError(
-            f"Target state is not a valid ResearchState: {to_state!r}",
+            f"Invalid target state: {to_state!r}",
             from_state=current.value,
             to_state=str(to_state),
         ) from exc
-
-    allowed = ALLOWED_TRANSITIONS.get(current, [])
-    if target not in allowed:
-        raise InvalidStateTransitionError(
-            f"Transition from '{current.value}' to '{target.value}' "
-            f"is not permitted.",
-            from_state=current.value,
-            to_state=target.value,
-        )
-
+    validate_transition(current, target)
     record = TransitionRecord(
         from_state=current,
         to_state=target,
@@ -615,13 +416,9 @@ def transition_state(
         gated=False,
         gate_passed=True,
     )
-
-    _apply_state(project, current_raw, target)
+    _apply_state(project, target)
     _write_audit(project, record, _audit_log)
-
     return project
-
-
 def transition_state_gated(
     project: Any,
     to_state: Any,
@@ -633,60 +430,20 @@ def transition_state_gated(
     _audit_log: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[Any, bool, List[str]]:
     """
-    Validate a state gate before transitioning a project to *to_state*.
-
-    Parameters
-    ----------
-    project      : Object with a `status` attribute.
-    to_state     : Target ResearchState (or coercible value).
-    gate_fn      : Callable that accepts *project* and returns
-                   ``(passed: bool, reasons: List[str])``.
-    triggered_by : Identifier of the actor requesting the transition.
-    note         : Optional annotation for the audit trail.
-    raise_on_fail: If True (default), raises StateGateError when the gate
-                   check fails.  If False, returns without transitioning.
-    _audit_log   : Optional external audit list.
-
-    Returns
-    -------
-    (project, passed, reasons)
-        project  — mutated if the gate passed, unchanged otherwise.
-        passed   — True if the gate passed and the transition occurred.
-        reasons  — List of failure reasons (empty on success).
-
-    Raises
-    ------
-    StateGateError
-        If raise_on_fail is True and the gate check fails.
-    InvalidStateTransitionError
-        If the topology does not permit the transition (checked after gate).
-
-    No-Invention Rule: gate evaluation is delegated entirely to *gate_fn*;
-    this function introduces no additional criteria.
+    Evaluate a supplied gate before performing a valid transition.
+    Gate evaluation is entirely delegated to gate_fn.
     """
-    current_raw = getattr(project, "status", None)
-
-    try:
-        current = _coerce_state(current_raw)
-    except ValueError as exc:
-        raise InvalidStateTransitionError(
-            f"Project has unrecognisable current state: {current_raw!r}",
-            from_state=str(current_raw),
-            to_state=str(to_state),
-        ) from exc
-
+    current = _get_project_state(project)
     try:
         target = _coerce_state(to_state)
     except ValueError as exc:
         raise InvalidStateTransitionError(
-            f"Target state is not a valid ResearchState: {to_state!r}",
+            f"Invalid target state: {to_state!r}",
             from_state=current.value,
             to_state=str(to_state),
         ) from exc
-
-    # --- Run the gate function ---
     passed, reasons = gate_fn(project)
-
+    reasons = list(reasons or [])
     record = TransitionRecord(
         from_state=current,
         to_state=target,
@@ -696,86 +453,47 @@ def transition_state_gated(
         gate_passed=passed,
         gate_reasons=reasons,
     )
-
     if not passed:
         _write_audit(project, record, _audit_log)
         if raise_on_fail:
             raise StateGateError(
-                f"Gate check failed: transition from '{current.value}' "
-                f"to '{target.value}' is blocked.",
+                (
+                    f"Gate check failed: transition from "
+                    f"'{current.value}' to '{target.value}' is blocked."
+                ),
                 reasons=reasons,
                 from_state=current.value,
                 to_state=target.value,
             )
         return project, False, reasons
-
-    # --- Gate passed: check topology ---
-    allowed = ALLOWED_TRANSITIONS.get(current, [])
-    if target not in allowed:
-        _write_audit(project, record, _audit_log)
-        raise InvalidStateTransitionError(
-            f"Transition from '{current.value}' to '{target.value}' "
-            f"is not permitted by the state machine.",
-            from_state=current.value,
-            to_state=target.value,
-        )
-
-    _apply_state(project, current_raw, target)
+    # Only after gate passes do we validate topology.
+    validate_transition(current, target)
+    _apply_state(project, target)
     _write_audit(project, record, _audit_log)
-
     return project, True, []
-
-
-# ===========================================================================
+# ============================================================================
 # StateManager
-# ===========================================================================
-
+# ============================================================================
 class StateManager:
     """
-    Project-level coordinator for state transitions.
-
-    Wraps transition_state() and transition_state_gated() with a
-    consistent interface and maintains an internal audit trail for
-    projects that do not expose their own.
-
-    Usage
-    -----
-    >>> sm = StateManager(project)
-    >>> sm.transition(ResearchState.QUESTION_DEFINED)
-    >>> sm.transition_gated(ResearchState.FRAMEWORK_BUILT, gate_fn)
+    Project-level coordinator around the canonical ResearchProject.state.
     """
-
     def __init__(self, project: Any) -> None:
         self._project = project
         self._audit: List[Dict[str, Any]] = []
-
-    # ------------------------------------------------------------------
-    # Properties
-    # ------------------------------------------------------------------
-
     @property
     def project(self) -> Any:
         return self._project
-
     @property
-    def current_state(self) -> ResearchState:
-        return _coerce_state(
-            getattr(self._project, "status", ResearchState.DRAFT)
-        )
-
+    def current_state(self) -> ResearchStateEnum:
+        return _get_project_state(self._project)
     @property
     def audit_trail(self) -> List[Dict[str, Any]]:
-        """Combined audit trail (project-level + internal fallback)."""
         for attr in ("audit_log", "audit_trail", "history"):
             trail = getattr(self._project, attr, None)
             if isinstance(trail, list):
                 return trail
         return list(self._audit)
-
-    # ------------------------------------------------------------------
-    # Transition helpers
-    # ------------------------------------------------------------------
-
     def transition(
         self,
         to_state: Any,
@@ -783,11 +501,6 @@ class StateManager:
         triggered_by: str = "system",
         note: str = "",
     ) -> "StateManager":
-        """
-        Unconditional transition.  Returns self for fluent chaining.
-
-        Raises InvalidStateTransitionError if the move is illegal.
-        """
         transition_state(
             self._project,
             to_state,
@@ -796,7 +509,6 @@ class StateManager:
             _audit_log=self._audit,
         )
         return self
-
     def transition_gated(
         self,
         to_state: Any,
@@ -806,12 +518,6 @@ class StateManager:
         note: str = "",
         raise_on_fail: bool = True,
     ) -> Tuple[bool, List[str]]:
-        """
-        Gate-checked transition.
-
-        Returns (passed, reasons).  If raise_on_fail is True (default),
-        StateGateError is raised on gate failure.
-        """
         _, passed, reasons = transition_state_gated(
             self._project,
             to_state,
@@ -822,324 +528,494 @@ class StateManager:
             _audit_log=self._audit,
         )
         return passed, reasons
-
-    # ------------------------------------------------------------------
-    # Introspection helpers
-    # ------------------------------------------------------------------
-
-    def allowed_next_states(self) -> List[ResearchState]:
-        """Return the list of states reachable from the current state."""
+    def allowed_next_states(self) -> List[ResearchStateEnum]:
         return get_valid_next_states(self.current_state)
-
     def can_transition_to(self, to_state: Any) -> bool:
-        """
-        Return True if a direct transition to *to_state* is topologically
-        valid from the current state.
-        """
-        try:
-            target = _coerce_state(to_state)
-        except ValueError:
-            return False
-        return target in get_valid_next_states(self.current_state)
-
+        return is_valid_transition(self.current_state, to_state)
     def is_terminal(self) -> bool:
-        """Return True if the project is in a terminal state (ARCHIVED)."""
-        return self.current_state == ResearchState.ARCHIVED
-
+        return self.current_state == ResearchStateEnum.READY_FOR_SUBMISSION
     def is_error(self) -> bool:
-        """Return True if the project is in the ERROR state."""
-        return self.current_state == ResearchState.ERROR
-
+        # ResearchStateEnum currently has no ERROR state.
+        return False
     def state_index(self) -> int:
-        """
-        Return the zero-based index of the current state in
-        all_states_in_order, or -1 if the state is not in the linear
-        sequence (i.e. ARCHIVED or ERROR).
-
-        Delegates to ``state_progress_index()`` for Sprint 1 / 2 / 3
-        compatibility.
-        """
         return state_progress_index(self.current_state)
-
     def is_before(self, other: Any) -> bool:
-        """Return True if current state precedes *other* in the linear order."""
+        my_index = state_progress_index(self.current_state)
         try:
-            other_state = _coerce_state(other)
-            my_idx = state_progress_index(self.current_state)
-            other_idx = state_progress_index(other_state)
-            return my_idx != -1 and other_idx != -1 and my_idx < other_idx
-        except ValueError:
+            other_index = state_progress_index(other)
+        except Exception:
             return False
-
+        return (
+            my_index != -1
+            and other_index != -1
+            and my_index < other_index
+        )
     def is_after(self, other: Any) -> bool:
-        """Return True if current state follows *other* in the linear order."""
+        my_index = state_progress_index(self.current_state)
         try:
-            other_state = _coerce_state(other)
-            my_idx = state_progress_index(self.current_state)
-            other_idx = state_progress_index(other_state)
-            return my_idx != -1 and other_idx != -1 and my_idx > other_idx
-        except ValueError:
+            other_index = state_progress_index(other)
+        except Exception:
             return False
-
-    def reset_to_draft(
+        return (
+            my_index != -1
+            and other_index != -1
+            and my_index > other_index
+        )
+    def reset_to_idea(
         self,
         *,
         triggered_by: str = "system",
-        note: str = "Manual reset to draft.",
+        note: str = "Manual reset to IDEA.",
     ) -> "StateManager":
-        """
-        Forcibly move an ERROR-state project back to DRAFT.
-
-        Only permitted from the ERROR state.  Raises
-        InvalidStateTransitionError otherwise.
-        """
-        if self.current_state != ResearchState.ERROR:
+        if self.current_state != ResearchStateEnum.QUESTION_DEFINED:
             raise InvalidStateTransitionError(
-                "reset_to_draft() is only permitted from the ERROR state.",
+                (
+                    "reset_to_idea() is only permitted from "
+                    "QUESTION_DEFINED."
+                ),
                 from_state=self.current_state.value,
-                to_state=ResearchState.DRAFT.value,
+                to_state=ResearchStateEnum.IDEA.value,
             )
         return self.transition(
-            ResearchState.DRAFT,
+            ResearchStateEnum.IDEA,
             triggered_by=triggered_by,
             note=note,
         )
-
     def __repr__(self) -> str:
         return (
-            f"StateManager("
+            "StateManager("
             f"project_id={getattr(self._project, 'id', 'unknown')!r}, "
             f"state={self.current_state.value!r})"
         )
-
-
-# ===========================================================================
-# Standalone Gate Helpers
-# ===========================================================================
-
-def gate_question_defined(project: Any) -> Tuple[bool, List[str]]:
+# ============================================================================
+# Gate helpers
+# ============================================================================
+def gate_question_defined(
+    project: Any,
+) -> Tuple[bool, List[str]]:
     """
-    Minimal gate: verify that the project carries a non-empty research
-    question before advancing from DRAFT to QUESTION_DEFINED.
-
-    No-Invention Rule: only inspects attributes present on *project*.
+    IDEA -> QUESTION_DEFINED
+    Requires a populated ResearchQuestion object with question_text.
     """
     reasons: List[str] = []
-
-    question = (
-        getattr(project, "research_question", None)
-        or getattr(project, "question", None)
-        or ""
-    )
-    if not str(question).strip():
+    question = getattr(project, "research_question", None)
+    if question is None:
         reasons.append(
-            "A research question must be defined before leaving the DRAFT state."
-        )
-
-    return len(reasons) == 0, reasons
-
-
-def gate_framework_built(project: Any) -> Tuple[bool, List[str]]:
-    """
-    Gate: verify that the project has a populated research framework
-    before advancing from QUESTION_DEFINED to FRAMEWORK_BUILT.
-    """
-    reasons: List[str] = []
-
-    framework = getattr(project, "framework", None)
-    if framework is None:
-        reasons.append(
-            "A research framework (PICO/PECO) must be built before advancing."
+            "A research question must be defined before leaving IDEA."
         )
         return False, reasons
-
-    fw_type = getattr(framework, "framework_type", "")
-    population = str(getattr(framework, "population", "")).strip()
-    outcome = str(getattr(framework, "outcome", "")).strip()
-
-    if not population:
-        reasons.append("Framework: Population (P) is required.")
-    if not outcome:
-        reasons.append("Framework: Outcome (O) is required.")
-
-    if str(fw_type).upper() == "PECO":
-        exposure = str(getattr(framework, "exposure", "")).strip()
-        if not exposure:
-            reasons.append("Framework: Exposure (E) is required for PECO.")
-    else:
-        intervention = str(getattr(framework, "intervention", "")).strip()
-        if not intervention:
-            reasons.append("Framework: Intervention (I) is required for PICO.")
-
-    return len(reasons) == 0, reasons
-
-
-def gate_design_selected(project: Any) -> Tuple[bool, List[str]]:
+    question_text = getattr(question, "question_text", None)
+    if not _has_non_empty_text(question_text):
+        reasons.append(
+            "Research question text is required."
+        )
+    return not reasons, reasons
+def gate_design_selected(
+    project: Any,
+) -> Tuple[bool, List[str]]:
     """
-    Gate: verify that a study design has been selected before advancing
-    from FRAMEWORK_BUILT to DESIGN_SELECTED.
+    QUESTION_DEFINED -> DESIGN_SELECTED
+    Requires a StudyDesign object.
     """
     reasons: List[str] = []
-
-    design = (
-        getattr(project, "study_design", None)
-        or getattr(project, "design", None)
-    )
+    design = getattr(project, "study_design", None)
     if design is None:
         reasons.append(
-            "A study design must be selected before advancing to DESIGN_SELECTED."
+            "A study design must be selected before advancing."
+        )
+    return not reasons, reasons
+def gate_protocol_ready(
+    project: Any,
+) -> Tuple[bool, List[str]]:
+    """
+    DESIGN_SELECTED -> PROTOCOL_READY
+    Validates the core protocol components that are explicitly represented
+    in ResearchProject.
+    """
+    reasons: List[str] = []
+    if getattr(project, "study_design", None) is None:
+        reasons.append("Study design is required.")
+    if getattr(project, "population", None) is None:
+        reasons.append("Population is required.")
+    if getattr(project, "primary_outcome", None) is None:
+        reasons.append("Primary outcome is required.")
+    if getattr(project, "inclusion_criteria", None) is None:
+        reasons.append("Inclusion criteria object is required.")
+    if getattr(project, "exclusion_criteria", None) is None:
+        reasons.append("Exclusion criteria object is required.")
+    return not reasons, reasons
+def gate_literature_search(
+    project: Any,
+) -> Tuple[bool, List[str]]:
+    """
+    PROTOCOL_READY -> LITERATURE_SEARCH
+    Requires a valid LiteratureSearchStrategy marked ready_for_search.
+    """
+    reasons: List[str] = []
+    strategy = getattr(
+        project,
+        "literature_search_strategy",
+        None,
+    )
+    if strategy is None:
+        reasons.append(
+            "A literature search strategy must be created."
         )
         return False, reasons
-
-    design_value = str(
-        getattr(design, "recommended_design", None)
-        or getattr(design, "value", None)
-        or design
-    ).strip()
-
-    if not design_value or design_value.lower() in (
-        "unknown",
-        "unknown / insufficient information",
-    ):
+    ready = getattr(strategy, "ready_for_search", False)
+    if ready is not True:
         reasons.append(
-            "Study design is UNKNOWN; a specific design must be confirmed."
+            "Literature search strategy is not ready for search."
         )
-
-    return len(reasons) == 0, reasons
-
-
-def gate_literature_searched(project: Any) -> Tuple[bool, List[str]]:
+    boolean_query = getattr(strategy, "boolean_query", None)
+    if not _has_non_empty_text(boolean_query):
+        reasons.append(
+            "A Boolean literature search query is required."
+        )
+    return not reasons, reasons
+def gate_screening(
+    project: Any,
+) -> Tuple[bool, List[str]]:
     """
-    Gate: verify that a literature search has been initiated / completed
-    before advancing from DESIGN_SELECTED to LITERATURE_SEARCH.
+    LITERATURE_SEARCH -> SCREENING
+    Requires actual literature records.
+    No synthetic records are accepted.
     """
     reasons: List[str] = []
-
-    lit = (
-        getattr(project, "literature_strategy", None)
-        or getattr(project, "search_strategy", None)
-        or getattr(project, "literature_results", None)
-    )
-    if lit is None:
+    records = getattr(project, "literature_records", None)
+    if not isinstance(records, list) or len(records) == 0:
         reasons.append(
-            "A literature search strategy must be defined before advancing."
+            "At least one retrieved literature record is required "
+            "before screening."
         )
-
-    return len(reasons) == 0, reasons
-
-
-def gate_literature_screened(project: Any) -> Tuple[bool, List[str]]:
+    return not reasons, reasons
+def gate_data_collection(
+    project: Any,
+) -> Tuple[bool, List[str]]:
     """
-    Gate: verify that literature screening has been completed before
-    advancing from LITERATURE_SEARCH to LITERATURE_SCREENED.
+    SCREENING -> DATA_COLLECTION
+    Requires screening decisions to exist and contain at least one
+    non-PENDING decision.
     """
     reasons: List[str] = []
-
-    screened = (
-        getattr(project, "screened_results", None)
-        or getattr(project, "screening_decisions", None)
+    decisions = getattr(
+        project,
+        "screening_decisions",
+        None,
     )
-    if screened is None:
+    if not isinstance(decisions, list) or len(decisions) == 0:
         reasons.append(
-            "Literature screening must be completed before advancing."
+            "Screening decisions are required before data collection."
         )
-
-    return len(reasons) == 0, reasons
-
-
-def gate_data_extracted(project: Any) -> Tuple[bool, List[str]]:
+        return False, reasons
+    non_pending = 0
+    for decision in decisions:
+        value = getattr(decision, "decision", None)
+        if value is None:
+            continue
+        try:
+            normalized = (
+                value.value
+                if hasattr(value, "value")
+                else str(value)
+            )
+            if normalized.upper() != "PENDING":
+                non_pending += 1
+        except Exception:
+            continue
+    if non_pending == 0:
+        reasons.append(
+            "At least one screening decision must be finalized."
+        )
+    return not reasons, reasons
+def gate_data_ready(
+    project: Any,
+) -> Tuple[bool, List[str]]:
     """
-    Gate: verify that data extraction has been performed before advancing
-    from LITERATURE_SCREENED to DATA_EXTRACTION.
+    DATA_COLLECTION -> DATA_READY
+    The current ResearchProject schema does not yet contain a dedicated
+    extracted-data field.
+    Therefore this gate only verifies that the project reached the state
+    with screening decisions available. It does not fabricate or infer
+    extracted data.
     """
     reasons: List[str] = []
-
-    extracted = (
-        getattr(project, "extracted_data", None)
-        or getattr(project, "data_extraction", None)
+    decisions = getattr(
+        project,
+        "screening_decisions",
+        None,
     )
-    if extracted is None:
+    if not isinstance(decisions, list) or len(decisions) == 0:
         reasons.append(
-            "Data extraction must be completed before advancing."
+            "Screening decisions must be available before data can "
+            "be marked ready."
         )
-
-    return len(reasons) == 0, reasons
-
-
-def gate_analysis_complete(project: Any) -> Tuple[bool, List[str]]:
+    return not reasons, reasons
+def gate_analysis_plan_locked(
+    project: Any,
+) -> Tuple[bool, List[str]]:
     """
-    Gate: verify that analysis has been performed before advancing from
-    DATA_EXTRACTION to ANALYSIS.
+    DATA_READY -> ANALYSIS_PLAN_LOCKED
+    Requires an AnalysisPlan with a primary analysis description.
     """
     reasons: List[str] = []
-
-    analysis = (
-        getattr(project, "analysis_results", None)
-        or getattr(project, "analysis", None)
+    analysis_plan = getattr(
+        project,
+        "analysis_plan",
+        None,
     )
-    if analysis is None:
+    if analysis_plan is None:
         reasons.append(
-            "Analysis must be completed before advancing to the REPORTING state."
+            "An analysis plan must be defined before it can be locked."
         )
-
-    return len(reasons) == 0, reasons
-
-
-def gate_reporting_complete(project: Any) -> Tuple[bool, List[str]]:
+        return False, reasons
+    primary = getattr(
+        analysis_plan,
+        "primary_analysis_description",
+        None,
+    )
+    if not _has_non_empty_text(primary):
+        reasons.append(
+            "Primary analysis description is required."
+        )
+    return not reasons, reasons
+def gate_analysis_complete(
+    project: Any,
+) -> Tuple[bool, List[str]]:
     """
-    Gate: verify that a report or manuscript is present before advancing
-    from REPORTING to COMPLETE.
+    ANALYSIS_PLAN_LOCKED -> ANALYSIS_COMPLETE
+    The current ResearchProject model does not yet expose a dedicated
+    analysis-results object.
+    Therefore this gate checks that an analysis plan exists and has a
+    primary analysis description. It does not claim that numerical
+    analysis has actually been performed.
     """
     reasons: List[str] = []
-
-    report = (
-        getattr(project, "report", None)
-        or getattr(project, "manuscript", None)
-        or getattr(project, "final_report", None)
+    analysis_plan = getattr(
+        project,
+        "analysis_plan",
+        None,
     )
-    if report is None:
+    if analysis_plan is None:
         reasons.append(
-            "A report or manuscript must be present before marking the "
-            "project COMPLETE."
+            "Analysis plan must exist before analysis can be marked complete."
         )
-
-    return len(reasons) == 0, reasons
-
-
-# ===========================================================================
-# Public re-exports
-# ===========================================================================
-
+        return False, reasons
+    primary = getattr(
+        analysis_plan,
+        "primary_analysis_description",
+        None,
+    )
+    if not _has_non_empty_text(primary):
+        reasons.append(
+            "Primary analysis description is required."
+        )
+    return not reasons, reasons
+def gate_manuscript_draft(
+    project: Any,
+) -> Tuple[bool, List[str]]:
+    """
+    ANALYSIS_COMPLETE -> MANUSCRIPT_DRAFT
+    The current ResearchProject schema does not yet have a manuscript
+    field.
+    This gate therefore requires the analysis plan and research question
+    to exist, without pretending that a manuscript was generated.
+    """
+    reasons: List[str] = []
+    if getattr(project, "research_question", None) is None:
+        reasons.append(
+            "Research question is required before manuscript drafting."
+        )
+    if getattr(project, "analysis_plan", None) is None:
+        reasons.append(
+            "Analysis plan is required before manuscript drafting."
+        )
+    return not reasons, reasons
+def gate_audit(
+    project: Any,
+) -> Tuple[bool, List[str]]:
+    """
+    MANUSCRIPT_DRAFT -> AUDIT
+    The current schema does not contain manuscript content or an audit
+    result object, so this gate only verifies the upstream state data
+    required to enter audit.
+    """
+    reasons: List[str] = []
+    if getattr(project, "research_question", None) is None:
+        reasons.append("Research question is missing.")
+    if getattr(project, "analysis_plan", None) is None:
+        reasons.append("Analysis plan is missing.")
+    return not reasons, reasons
+def gate_journal_selection(
+    project: Any,
+) -> Tuple[bool, List[str]]:
+    """
+    AUDIT -> JOURNAL_SELECTION
+    No journal field currently exists in ResearchProject, so the gate
+    does not fabricate one. It only verifies that the project contains
+    the upstream research components.
+    """
+    reasons: List[str] = []
+    if getattr(project, "research_question", None) is None:
+        reasons.append("Research question is missing.")
+    if getattr(project, "study_design", None) is None:
+        reasons.append("Study design is missing.")
+    return not reasons, reasons
+def gate_ready_for_submission(
+    project: Any,
+) -> Tuple[bool, List[str]]:
+    """
+    JOURNAL_SELECTION -> READY_FOR_SUBMISSION
+    Requires the core research artifacts represented by the current model.
+    """
+    reasons: List[str] = []
+    if getattr(project, "research_question", None) is None:
+        reasons.append("Research question is required.")
+    if getattr(project, "study_design", None) is None:
+        reasons.append("Study design is required.")
+    if getattr(project, "research_framework", None) is None:
+        reasons.append("Research framework is required.")
+    if getattr(project, "primary_outcome", None) is None:
+        reasons.append("Primary outcome is required.")
+    return not reasons, reasons
+# ============================================================================
+# Gate registry
+# ============================================================================
+STATE_GATES: Dict[
+    Tuple[ResearchStateEnum, ResearchStateEnum],
+    Callable[[Any], Tuple[bool, List[str]]],
+] = {
+    (
+        ResearchStateEnum.IDEA,
+        ResearchStateEnum.QUESTION_DEFINED,
+    ): gate_question_defined,
+    (
+        ResearchStateEnum.QUESTION_DEFINED,
+        ResearchStateEnum.DESIGN_SELECTED,
+    ): gate_design_selected,
+    (
+        ResearchStateEnum.DESIGN_SELECTED,
+        ResearchStateEnum.PROTOCOL_READY,
+    ): gate_protocol_ready,
+    (
+        ResearchStateEnum.PROTOCOL_READY,
+        ResearchStateEnum.LITERATURE_SEARCH,
+    ): gate_literature_search,
+    (
+        ResearchStateEnum.LITERATURE_SEARCH,
+        ResearchStateEnum.SCREENING,
+    ): gate_screening,
+    (
+        ResearchStateEnum.SCREENING,
+        ResearchStateEnum.DATA_COLLECTION,
+    ): gate_data_collection,
+    (
+        ResearchStateEnum.DATA_COLLECTION,
+        ResearchStateEnum.DATA_READY,
+    ): gate_data_ready,
+    (
+        ResearchStateEnum.DATA_READY,
+        ResearchStateEnum.ANALYSIS_PLAN_LOCKED,
+    ): gate_analysis_plan_locked,
+    (
+        ResearchStateEnum.ANALYSIS_PLAN_LOCKED,
+        ResearchStateEnum.ANALYSIS_COMPLETE,
+    ): gate_analysis_complete,
+    (
+        ResearchStateEnum.ANALYSIS_COMPLETE,
+        ResearchStateEnum.MANUSCRIPT_DRAFT,
+    ): gate_manuscript_draft,
+    (
+        ResearchStateEnum.MANUSCRIPT_DRAFT,
+        ResearchStateEnum.AUDIT,
+    ): gate_audit,
+    (
+        ResearchStateEnum.AUDIT,
+        ResearchStateEnum.JOURNAL_SELECTION,
+    ): gate_journal_selection,
+    (
+        ResearchStateEnum.JOURNAL_SELECTION,
+        ResearchStateEnum.READY_FOR_SUBMISSION,
+    ): gate_ready_for_submission,
+}
+def get_gate(
+    from_state: Any,
+    to_state: Any,
+) -> Optional[Callable[[Any], Tuple[bool, List[str]]]]:
+    """
+    Return the registered gate for a transition, if one exists.
+    """
+    try:
+        source = _coerce_state(from_state)
+        target = _coerce_state(to_state)
+    except ValueError:
+        return None
+    return STATE_GATES.get((source, target))
+def validate_gate(
+    project: Any,
+    to_state: Any,
+) -> Tuple[bool, List[str]]:
+    """
+    Validate the gate associated with the project's current state and
+    requested target.
+    If no gate is registered, the topology is still checked.
+    """
+    current = _get_project_state(project)
+    try:
+        target = _coerce_state(to_state)
+    except ValueError as exc:
+        return False, [str(exc)]
+    if not is_valid_transition(current, target):
+        return False, [
+            (
+                f"Transition from '{current.value}' "
+                f"to '{target.value}' is not permitted."
+            )
+        ]
+    gate_fn = get_gate(current, target)
+    if gate_fn is None:
+        return True, []
+    return gate_fn(project)
+# ============================================================================
+# Public API
+# ============================================================================
 __all__ = [
+    # Compatibility
+    "ResearchState",
+    "ResearchStateEnum",
     # Exceptions
     "StateGateError",
     "InvalidStateTransitionError",
-    # Enumeration
-    "ResearchState",
-    # Canonical ordered sequence
+    # Lifecycle
     "all_states_in_order",
-    # Topology map
     "ALLOWED_TRANSITIONS",
-    # Sprint 1 public helpers
+    "STATE_GATES",
+    # Helpers
     "state_progress_index",
     "validate_transition",
-    # Sprint 2 public query functions
     "get_valid_next_states",
     "is_valid_transition",
-    # Core transition functions
+    "get_gate",
+    "validate_gate",
+    # Audit
+    "TransitionRecord",
+    # Transition functions
     "transition_state",
     "transition_state_gated",
-    # State manager class
+    # Coordinator
     "StateManager",
-    # Audit record
-    "TransitionRecord",
-    # Standalone gate helpers
+    # Gates
     "gate_question_defined",
-    "gate_framework_built",
     "gate_design_selected",
-    "gate_literature_searched",
-    "gate_literature_screened",
-    "gate_data_extracted",
+    "gate_protocol_ready",
+    "gate_literature_search",
+    "gate_screening",
+    "gate_data_collection",
+    "gate_data_ready",
+    "gate_analysis_plan_locked",
     "gate_analysis_complete",
-    "gate_reporting_complete",
+    "gate_manuscript_draft",
+    "gate_audit",
+    "gate_journal_selection",
+    "gate_ready_for_submission",
 ]
