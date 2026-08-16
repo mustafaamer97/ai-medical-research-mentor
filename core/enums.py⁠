@@ -1,0 +1,57 @@
+"""
+Canonical enumerations for the AI Research Co-Pilot domain.
+
+Each enum is defined exactly once.
+No aliases. No legacy names. No duplicates.
+"""
+
+from enum import Enum
+
+
+class ProjectState(str, Enum):
+    """
+    Canonical lifecycle states for a ResearchProject.
+
+    Exactly one field on ResearchProject uses this enum: `state`.
+    There is no competing `status` field.
+
+    Sprint 1 lifecycle only. Future sprints extend this.
+    """
+    IDEA = "IDEA"
+    QUESTION_DEFINED = "QUESTION_DEFINED"
+    DESIGN_SELECTED = "DESIGN_SELECTED"
+    PROTOCOL_READY = "PROTOCOL_READY"
+
+
+class StudyDesignType(str, Enum):
+    """
+    Canonical study design types supported in Sprint 1.
+
+    Defined once. Not duplicated elsewhere.
+    """
+    CROSS_SECTIONAL = "Cross-sectional"
+    COHORT = "Cohort"
+    CASE_CONTROL = "Case-control"
+    RANDOMIZED_CONTROLLED_TRIAL = "Randomized controlled trial"
+    DIAGNOSTIC = "Diagnostic study"
+    OTHER = "Other"
+
+
+class TaskStatus(str, Enum):
+    """
+    Canonical task status values.
+    """
+    TODO = "TODO"
+    IN_PROGRESS = "IN_PROGRESS"
+    COMPLETED = "COMPLETED"
+    BLOCKED = "BLOCKED"
+
+
+class TaskPriority(str, Enum):
+    """
+    Canonical task priority values.
+    """
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+    CRITICAL = "CRITICAL"
