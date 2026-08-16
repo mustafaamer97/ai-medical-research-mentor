@@ -1,52 +1,81 @@
-from __future__ import annotations
+"""
+AI Research Co-Pilot — Application Entry Point
+
+Sprint 1: Minimal Streamlit shell.
+
+Purpose:
+  - Verify domain loads correctly
+  - Verify ResearchProject can be instantiated
+  - Verify application starts successfully
+
+The complete UI will be built in future sprints after
+the domain foundation is frozen.
+"""
 
 import streamlit as st
 
-from config.settings import APP_TITLE
-from core.persistence import clear_project, load_project, save_project
-from ui.dashboard import render_dashboard
-from ui.onboarding import render_onboarding
+from research_copilot.core.enums import ProjectState
+from research_copilot.core.models import ResearchProject
+from research_copilot.core.project import create_project
 
-st.set_page_config(
-    page_title=APP_TITLE,
-    page_icon="🔬",
-    layout="centered",
-    initial_sidebar_state="collapsed",
-)
 
-if "project" not in st.session_state:
-    st.session_state.project = load_project()
-
-if "page" not in st.session_state:
-    st.session_state.page = (
-        "dashboard" if st.session_state.project else "onboarding"
+def main() -> None:
+    st.set_page_config(
+        page_title="AI Research Co-Pilot",
+        page_icon="🔬",
+        layout="wide",
     )
 
-with st.sidebar:
-    st.title("🔬 Research Mentor")
-    st.markdown("---")
-    if st.session_state.project:
-        st.markdown(f"**Project:** {st.session_state.project.title}")
-        st.markdown(f"**State:** {st.session_state.project.state.value}")
-        st.markdown("---")
-        if st.button("🗑️ Delete Project", use_container_width=True):
-            clear_project()
-            st.session_state.project = None
-            st.session_state.page = "onboarding"
-            st.rerun()
-    else:
-        st.info("No active project.")
-    st.markdown("---")
-    st.caption("Sprint 1 — Research Foundation")
+    st.title("🔬 AI Research Co-Pilot")
+    st.caption("Sprint 1 — Domain Foundation")
 
-if st.session_state.page == "onboarding" or st.session_state.project is None:
-    project = render_onboarding()
-    if project is not None:
-        st.session_state.project = project
-        save_project(project)
-        st.session_state.page = "dashboard"
-        st.rerun()
-elif st.session_state.page == "dashboard":
-    project = render_dashboard(st.session_state.project)
-    save_project(project)
-    st.session_state.project = project
+    st.info(
+        "Sprint 1 establishes the canonical domain model. "
+        "The full UI will be implemented in Sprint 2 onwards."
+    )
+
+    st.divider()
+
+    # ------------------------------------------------------------------
+    # Domain verification: instantiate a ResearchProject
+    # ------------------------------------------------------------------
+    st.subheader("Domain Verification")
+
+    try:
+        demo_project = create_project(
+            title="Demo Research Project",
+            idea=(
+                "This is a demonstration project created to verify that the "
+                "ResearchProject domain model loads and operates correctly."
+            ),
+        )
+
+        st.success("✅ ResearchProject domain loaded successfully.")
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Project ID", demo_project.id[:8] + "…")
+        with col2:
+            st.metric("State", demo_project.state.value)
+        with col3:
+            st.metric(
+                "Created",
+                demo_project.created_at.strftime("%Y-%m-%d %H:%M UTC"),
+            )
+
+        with st.expander("Full domain object (JSON)", expanded=False):
+            st.json(demo_project.model_dump(mode="json"))
+
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"❌ Domain instantiation failed: {exc}")
+        raise
+
+    st.divider()
+    st.caption(
+        "AI Research Co-Pilot · Sprint 1 · "
+        "Domain foundation — researcher remains the decision-maker."
+    )
+
+
+if __name__ == "__main__":
+    main()
